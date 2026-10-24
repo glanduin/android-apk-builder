@@ -19,7 +19,7 @@ class MainActivity : AppCompatActivity() {
     private val RECORD_AUDIO_PERMISSION_REQUEST = 1001
     private val NOTIFICATION_PERMISSION_REQUEST = 1002
     private val MEDIA_PROJECTION_REQUEST = 1003
-    private val MAX_GAIN = 20f
+    private val MAX_GAIN = 2.0f            // ← was 20f. 50% slider = 1.0× = unity
 
     private lateinit var statusText: TextView
     private lateinit var gainLabel: TextView
@@ -45,14 +45,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         gainSeek.max = 100
-        gainSeek.progress = 5
-        AudioCaptureService.gain = 1f
-        gainLabel.text = "Gain: 5%  (1.0×)"
+        gainSeek.progress = 50                  // 50% = unity gain
+        AudioCaptureService.gain = 1.0f
+        gainLabel.text = "Gain: 50%  (1.0× = same as normal max volume)"
 
         gainSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 val g = progress / 100f * MAX_GAIN
-                gainLabel.text = "Gain: $progress%  (${"%.1f".format(g)}×)"
+                val note = when {
+                    g < 0.02f -> "silent"
+                    g < 0.95f -> "quieter than normal"
+                    g <= 1.05f -> "≈ normal max loudness"
+                    else -> "boost (soft clip on peaks)"
+                }
+                gainLabel.text = "Gain: $progress%  (${"%.2f".format(g)}× — $note)"
                 AudioCaptureService.gain = g
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
