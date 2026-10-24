@@ -2,6 +2,7 @@ package com.example.sampleapp
 
 import android.Manifest
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
@@ -16,6 +17,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -28,6 +30,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var volumeSeek: SeekBar
     private lateinit var mediaProjectionManager: MediaProjectionManager
     private var mediaController: MediaController? = null
+    private var maxVolume: Int = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,7 +43,8 @@ class MainActivity : AppCompatActivity() {
         volumeLabel = findViewById(R.id.volumeLabel)
         volumeSeek = findViewById(R.id.volumeSeek)
 
-        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionManager =
+            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         volumeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -76,7 +80,9 @@ class MainActivity : AppCompatActivity() {
         }
         try {
             val msm = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
-            val sessions = msm.getActiveSessions(null)
+            val listenerComponent =
+                ComponentName(this, MyNotificationListener::class.java)
+            val sessions = msm.getActiveSessions(listenerComponent)
             val pkgList = sessions.joinToString(", ") { it.packageName }
             val musicolet = sessions.find { it.packageName == "in.krosbits.musicolet" }
             if (musicolet == null) {
@@ -86,26 +92,34 @@ class MainActivity : AppCompatActivity() {
             }
             mediaController = MediaController(this, musicolet.sessionToken)
             val pb = mediaController?.playbackInfo
+            maxVolume = pb?.maxVolume ?: 0
             statusText.text = "✓ Attached to in.krosbits.musicolet\n" +
-                "volume=${pb?.currentVolume} / max=${pb?.maxVolume}\n" +
+                "currentVolume=${pb?.currentVolume}  maxVolume=$maxVolume\n" +
                 "Drag the slider to test."
         } catch (t: Throwable) {
             statusText.text = "attach failed: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
-    private fun applyMediaControllerVolume(volume: Float) {
+    private fun applyMediaControllerVolume(fraction: Float) {
         val ctrl = mediaController
         if (ctrl == null) {
             statusText.text = "No controller. Tap 'Attach to Musicolet' first."
             return
         }
+        if (maxVolume <= 0) {
+            statusText.text = "maxVolume=0 — cannot set via MediaController.\nTap Attach again."
+            return
+        }
         try {
-            ctrl.setVolume(volume)
-            val newVol = ctrl.playbackInfo?.currentVolume
-            statusText.text = "setVolume($volume) → reported volume: $newVol"
+            val target = (fraction * maxVolume).roundToInt().coerceIn(0, maxVolume)
+            ctrl.setVolumeTo(target, 0)
+            val newPb = ctrl.playbackInfo
+            statusText.text = "setVolumeTo($target) / max $maxVolume\n" +
+                "→ reported currentVolume: ${newPb?.currentVolume}\n" +
+                "drag fraction=$fraction"
         } catch (t: Throwable) {
-            statusText.text = "setVolume failed: ${t.javaClass.simpleName}: ${t.message}"
+            statusText.text = "setVolumeTo failed: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
@@ -147,8 +161,11 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    NOTIFICATION_PERMISSION_REQUEST
+                )
             }
         }
     }
@@ -156,8 +173,11 @@ class MainActivity : AppCompatActivity() {
     private fun requestRecordAudioPermissionIfNeeded() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this,
-                arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_PERMISSION_REQUEST)
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                RECORD_AUDIO_PERMISSION_REQUEST
+            )
         }
     }
 
