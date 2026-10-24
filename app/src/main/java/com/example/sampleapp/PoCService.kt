@@ -37,7 +37,7 @@ class PoCService : Service() {
             updateStatus("startForeground FAILED: ${t.javaClass.simpleName}: ${t.message}")
             stopSelf(); return START_NOT_STICKY
         }
-        Thread { runDiagnostic() }.start()
+        Thread { runPoC() }.start()
         return START_STICKY
     }
 
@@ -47,90 +47,55 @@ class PoCService : Service() {
         statusCallback?.invoke(msg)
     }
 
-    private fun runDiagnostic() {
+    private fun runPoC() {
         try {
             val report = StringBuilder()
+            updateStatus("Running dumpsys…")
 
             val flingerDump = runShizukuCommandWithOutput(arrayOf("dumpsys", "media.audio_flinger"))
-            val audioDump = runShizukuCommandWithOutput(arrayOf("dumpsys", "audio"))
-
-            // ── FLINGER ──
-            report.appendLine("═══ AUDIO FLINGER ═══")
             if (flingerDump.isNullOrBlank()) {
-                report.appendLine("(null/empty)")
-            } else {
-                val lines = flingerDump.lines()
-                report.appendLine("${lines.size} lines")
-                report.appendLine()
-                report.appendLine("Threads:")
-                var threadCount = 0
-                for (i in lines.indices) {
-                    val t = lines[i].trim()
-                    if (t.startsWith("Output thread", true) || t.startsWith("Input thread", true)) {
-                        threadCount++
-                        val nameMatch = Regex("""name\s+(\w+)""").find(t)
-                        val name = nameMatch?.groupValues?.get(1) ?: "?"
-                        var countStr = "?"
-                        for (j in i + 1 until minOf(i + 500, lines.size)) {
-                            val lt = lines[j].trim()
-                            if (lt.startsWith("Output thread", true) || lt.startsWith("Input thread", true)) break
-                            if (lt.contains("Tracks of which", true)) {
-                                countStr = lt
-                                break
-                            }
-                        }
-                        report.appendLine("  [$name] $countStr")
-                    }
-                }
-                if (threadCount == 0) report.appendLine("  (none)")
-                report.appendLine()
-
-                report.appendLine("Active sessions (from tracks):")
-                val sess = findAllActiveSessionIds(flingerDump)
-                report.appendLine("  $sess")
-                report.appendLine()
-
-                report.appendLine("Global session refs:")
-                var inRefs = false
-                var foundRefs = false
-                for (line in lines) {
-                    val t = line.trim()
-                    if (t.startsWith("Global session refs", true)) { inRefs = true; continue }
-                    if (inRefs) {
-                        if (t.startsWith("Output thread", true) || t.startsWith("Input thread", true)) break
-                        if (t.isNotEmpty()) { report.appendLine("  $t"); foundRefs = true }
-                    }
-                }
-                if (!foundRefs) report.appendLine("  (empty)")
+                updateStatus("dumpsys media.audio_flinger returned nothing.")
+                return
             }
+
+            // PRIMARY: Global session refs — the authoritative source
+            val fromRefs = parseGlobalSessionRefs(flingerDump)
+            report.appendLine("Global session refs found: $fromRefs")
+
+            // FALLBACK: track tables
+            val fromTracks = parseTrackTables(flingerDump)
+            report.appendLine("Track tables found: $fromTracks")
+
+            val targets = (fromRefs + fromTracks).distinct()
+            report.appendLine("Targeting: $targets")
             report.appendLine()
 
-            // ── AUDIO MANAGER ──
-            report.appendLine("═══ DUMPSYS AUDIO ═══")
-            if (audioDump.isNullOrBlank()) {
-                report.appendLine("(null/empty)")
-            } else {
-                val lines = audioDump.lines()
-                report.appendLine("${lines.size} lines")
-                report.appendLine("Players (piid/sessionId):")
-                val playerLines = lines.filter {
-                    it.contains("Player piid:", true) ||
-                    (it.contains("sessionId:", true) && it.contains("state:", true))
-                }
-                if (playerLines.isEmpty()) {
-                    report.appendLine("  (none)")
+            if (targets.isEmpty()) {
+                updateStatus("$report\nNo sessions to target.\nMake sure music is playing.")
+                return
+            }
+
+            // Release any previous effects so we can re-attach cleanly
+            effects.forEach { runCatching { it.release() } }
+            effects.clear()
+
+            var ok = 0
+            var fail = 0
+            for (id in targets) {
+                if (tryAttach(id, -10f)) {
+                    ok++
+                    report.appendLine("✓ session $id  (−10 dB)")
                 } else {
-                    playerLines.take(25).forEach { report.appendLine("  " + it.trim()) }
-                    if (playerLines.size > 25) report.appendLine("  ...(${playerLines.size - 25} more)")
+                    fail++
+                    report.appendLine("✗ session $id  attach FAILED")
                 }
+            }
+            report.appendLine()
+            report.appendLine("Attached: $ok  /  Failed: $fail")
+            if (ok > 0) {
                 report.appendLine()
-                report.appendLine("All sessionIds mentioned:")
-                val idRegex = Regex("""sessionId[:=]\s*(\d+)""")
-                val allIds = mutableSetOf<Int>()
-                lines.forEach { l -> idRegex.findAll(l).forEach { m ->
-                    m.groupValues[1].toIntOrNull()?.let { if (it > 0) allIds.add(it) }
-                } }
-                report.appendLine("  ${allIds.sorted()}")
+                report.appendLine("▶ Listen for the volume drop NOW.")
+                report.appendLine("Tap again to re-attach if it didn't take effect.")
             }
 
             updateStatus(report.toString())
@@ -139,20 +104,63 @@ class PoCService : Service() {
         }
     }
 
-    private fun findAllActiveSessionIds(dumpsysOutput: String): List<Int> {
-        val sessionIds = mutableListOf<Int>()
-        val lines = dumpsysOutput.lines()
+    /**
+     * Parses the "Global session refs:" block, which lists every audio session
+     * currently held by any app in AudioFlinger.
+     *
+     * Example format:
+     *   Global session refs:
+     *     session  cnt   pid    uid  name
+     *     1713     2     9469   10212  in.krosbits.musicolet
+     */
+    private fun parseGlobalSessionRefs(output: String): List<Int> {
+        val sessions = mutableListOf<Int>()
+        val lines = output.lines()
+        var inRefs = false
+        var headerSeen = false
+
+        for (line in lines) {
+            val t = line.trim()
+            if (t.startsWith("Global session refs", true)) {
+                inRefs = true
+                headerSeen = false
+                continue
+            }
+            if (!inRefs) continue
+            if (t.startsWith("Output thread", true) ||
+                t.startsWith("Input thread", true) ||
+                t.startsWith("Hardware status", true) ||
+                t.startsWith("Standby Time", true) ||
+                t.startsWith("mHifiState", true) ||
+                t.startsWith("mLowPower", true)
+            ) break
+
+            if (t.startsWith("session", true) && t.contains("cnt", true)) {
+                headerSeen = true
+                continue
+            }
+            if (headerSeen && t.isNotEmpty()) {
+                val parts = t.split(Regex("""\s+"""))
+                if (parts.size >= 5) {
+                    parts[0].toIntOrNull()?.let { if (it > 0) sessions.add(it) }
+                }
+            }
+        }
+        return sessions.distinct()
+    }
+
+    private fun parseTrackTables(output: String): List<Int> {
+        val sessions = mutableListOf<Int>()
+        val lines = output.lines()
         var inSection = false
         var sessionCol = -1
         var activeCol = -1
         var sCol = -1
 
-        for (rawLine in lines) {
-            val line = rawLine.trim()
-            if (line.contains("Tracks of which", true) &&
-                line.contains("are active", true)
-            ) {
-                val m = Regex("""(\d+)\s+Tracks of which\s+(\d+)\s+are active""").find(line)
+        for (line in lines) {
+            val t = line.trim()
+            if (t.contains("Tracks of which", true) && t.contains("are active", true)) {
+                val m = Regex("""(\d+)\s+Tracks of which\s+(\d+)\s+are active""").find(t)
                 val a = m?.groupValues?.get(2)?.toIntOrNull() ?: 0
                 inSection = a > 0
                 sessionCol = -1; activeCol = -1; sCol = -1
@@ -160,46 +168,62 @@ class PoCService : Service() {
             }
             if (!inSection) continue
             if (sessionCol == -1 &&
-                line.contains("Session", true) &&
-                line.contains("Active", true) &&
-                line.contains("Id", true)
+                t.contains("Session", true) &&
+                t.contains("Active", true) &&
+                t.contains("Id", true)
             ) {
-                val headers = line.split(Regex("""\s+"""))
+                val headers = t.split(Regex("""\s+"""))
                 sessionCol = headers.indexOfFirst { it.equals("Session", true) }
                 activeCol = headers.indexOfFirst { it.equals("Active", true) }
                 sCol = headers.indexOfFirst { it.equals("S", true) }
                 continue
             }
-            if (line.isBlank() ||
-                line.startsWith("Output thread", true) ||
-                line.startsWith("Input thread", true)
+            if (t.isBlank() ||
+                t.startsWith("Output thread", true) ||
+                t.startsWith("Input thread", true)
             ) { inSection = false; continue }
 
             if (sessionCol >= 0) {
-                val cols = line.split(Regex("""\s+"""))
+                val cols = t.split(Regex("""\s+"""))
                 if (cols.size > maxOf(sessionCol, activeCol, sCol)) {
-                    val active = (activeCol >= 0 && cols[activeCol].equals("yes", true)) ||
-                                 (sCol >= 0 && cols[sCol].equals("A", true))
-                    if (active) cols[sessionCol].toIntOrNull()?.let { if (it > 0) sessionIds.add(it) }
+                    val active =
+                        (activeCol >= 0 && cols[activeCol].equals("yes", true)) ||
+                        (sCol >= 0 && cols[sCol].equals("A", true))
+                    if (active) {
+                        cols[sessionCol].toIntOrNull()?.let { if (it > 0) sessions.add(it) }
+                    }
                 }
             }
         }
-        return sessionIds.distinct()
+        return sessions.distinct()
     }
 
-    private fun applyGainToSession(sessionId: Int, gainDb: Float): Boolean {
+    private fun tryAttach(sessionId: Int, gainDb: Float): Boolean {
         return try {
             val config = DynamicsProcessing.Config.Builder(
                 DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                2, true, 1, false, 0, false, 0, false
+                2,      // stereo
+                true,   // pre-EQ used
+                1,      // 1 pre-EQ band
+                false,  // no MBC
+                0,
+                false,  // no post-EQ
+                0,
+                false   // no limiter
             ).build()
+
             val effect = DynamicsProcessing(0, sessionId, config)
             effect.setInputGainAllChannelsTo(gainDb)
+
+            // Verify the effect actually got enabled
+            if (!effect.enabled) {
+                Log.w(TAG, "Effect attached to $sessionId but not enabled")
+            }
             effects.add(effect)
-            Log.d(TAG, "Attached −10 dB to session $sessionId")
+            Log.d(TAG, "Attached $gainDb dB to session $sessionId (enabled=${effect.enabled})")
             true
         } catch (t: Throwable) {
-            Log.e(TAG, "Effect attach failed for session $sessionId: ${t.message}", t)
+            Log.e(TAG, "Attach failed for session $sessionId: ${t.javaClass.simpleName}: ${t.message}", t)
             false
         }
     }
@@ -241,13 +265,14 @@ class PoCService : Service() {
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Volume PoC")
-            .setContentText("Diagnostic running…")
+            .setContentText("Attaching effects…")
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
+
     override fun onDestroy() {
         super.onDestroy()
         effects.forEach { runCatching { it.release() } }
