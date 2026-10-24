@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -27,33 +26,36 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         statusText.text = PoCService.currentStatus
 
-        // Wire the service's status updates to the TextView
         PoCService.statusCallback = { msg ->
             runOnUiThread { statusText.text = msg }
         }
 
         findViewById<Button>(R.id.startButton).setOnClickListener {
-            if (checkShizukuPermission()) {
-                startPoCService()
-            } else {
-                requestShizukuPermission()
+            try {
+                handleClick()
+            } catch (t: Throwable) {
+                statusText.text = "CRASH CAUGHT:\n${t.javaClass.simpleName}: ${t.message}"
             }
         }
 
         requestNotificationPermissionIfNeeded()
     }
 
-    private fun checkShizukuPermission(): Boolean {
-        return !Shizuku.isPreV11() &&
-                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun requestShizukuPermission() {
-        if (Shizuku.isPreV11()) {
-            Toast.makeText(this, "Shizuku version is too old", Toast.LENGTH_SHORT).show()
+    private fun handleClick() {
+        if (!Shizuku.pingBinder()) {
+            statusText.text = "Shizuku binder is not alive.\nOpen Shizuku app and start the service, then try again."
             return
         }
-        Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+        if (Shizuku.isPreV11()) {
+            statusText.text = "Shizuku version too old (pre-v11). Update Shizuku."
+            return
+        }
+        if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+            startPoCService()
+        } else {
+            statusText.text = "Requesting Shizuku permission…"
+            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -64,17 +66,21 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "Shizuku permission granted", Toast.LENGTH_SHORT).show()
                 startPoCService()
             } else {
-                Toast.makeText(this, "Shizuku permission denied", Toast.LENGTH_SHORT).show()
+                statusText.text = "Shizuku permission denied."
             }
         }
     }
 
     private fun startPoCService() {
-        val intent = Intent(this, PoCService::class.java)
-        ContextCompat.startForegroundService(this, intent)
+        try {
+            val intent = Intent(this, PoCService::class.java)
+            ContextCompat.startForegroundService(this, intent)
+            statusText.text = "Service starting…"
+        } catch (t: Throwable) {
+            statusText.text = "Failed to start service:\n${t.javaClass.simpleName}: ${t.message}"
+        }
     }
 
     private fun requestNotificationPermissionIfNeeded() {
