@@ -27,11 +27,7 @@ class PoCService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        try {
-            createNotificationChannel()
-        } catch (t: Throwable) {
-            Log.e(TAG, "Channel create failed", t)
-        }
+        try { createNotificationChannel() } catch (t: Throwable) { Log.e(TAG, "channel", t) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -39,10 +35,9 @@ class PoCService : Service() {
             startForeground(1, buildNotification())
         } catch (t: Throwable) {
             updateStatus("startForeground FAILED: ${t.javaClass.simpleName}: ${t.message}")
-            stopSelf()
-            return START_NOT_STICKY
+            stopSelf(); return START_NOT_STICKY
         }
-        Thread { runPoC() }.start()
+        Thread { runDiagnostic() }.start()
         return START_STICKY
     }
 
@@ -52,123 +47,143 @@ class PoCService : Service() {
         statusCallback?.invoke(msg)
     }
 
-    private fun runPoC() {
+    private fun runDiagnostic() {
         try {
-            updateStatus("Running dumpsys media.audio_flinger via Shizuku…")
+            val report = StringBuilder()
 
-            val output = runShizukuCommandWithOutput(
-                arrayOf("dumpsys", "media.audio_flinger")
-            )
+            val flingerDump = runShizukuCommandWithOutput(arrayOf("dumpsys", "media.audio_flinger"))
+            val audioDump = runShizukuCommandWithOutput(arrayOf("dumpsys", "audio"))
 
-            if (output.isNullOrBlank()) {
-                updateStatus("dumpsys returned nothing. Shizuku exec failed.")
-                return
+            // ── FLINGER ──
+            report.appendLine("═══ AUDIO FLINGER ═══")
+            if (flingerDump.isNullOrBlank()) {
+                report.appendLine("(null/empty)")
+            } else {
+                val lines = flingerDump.lines()
+                report.appendLine("${lines.size} lines")
+                report.appendLine()
+                report.appendLine("Threads:")
+                var threadCount = 0
+                for (i in lines.indices) {
+                    val t = lines[i].trim()
+                    if (t.startsWith("Output thread", true) || t.startsWith("Input thread", true)) {
+                        threadCount++
+                        val nameMatch = Regex("""name\s+(\w+)""").find(t)
+                        val name = nameMatch?.groupValues?.get(1) ?: "?"
+                        var countStr = "?"
+                        for (j in i + 1 until minOf(i + 500, lines.size)) {
+                            val lt = lines[j].trim()
+                            if (lt.startsWith("Output thread", true) || lt.startsWith("Input thread", true)) break
+                            if (lt.contains("Tracks of which", true)) {
+                                countStr = lt
+                                break
+                            }
+                        }
+                        report.appendLine("  [$name] $countStr")
+                    }
+                }
+                if (threadCount == 0) report.appendLine("  (none)")
+                report.appendLine()
+
+                report.appendLine("Active sessions (from tracks):")
+                val sess = findAllActiveSessionIds(flingerDump)
+                report.appendLine("  $sess")
+                report.appendLine()
+
+                report.appendLine("Global session refs:")
+                var inRefs = false
+                var foundRefs = false
+                for (line in lines) {
+                    val t = line.trim()
+                    if (t.startsWith("Global session refs", true)) { inRefs = true; continue }
+                    if (inRefs) {
+                        if (t.startsWith("Output thread", true) || t.startsWith("Input thread", true)) break
+                        if (t.isNotEmpty()) { report.appendLine("  $t"); foundRefs = true }
+                    }
+                }
+                if (!foundRefs) report.appendLine("  (empty)")
             }
-            Log.d(TAG, "dumpsys length: ${output.length}")
+            report.appendLine()
 
-            val sessionIds = findAllActiveSessionIds(output)
-            updateStatus("Found ${sessionIds.size} active session(s): $sessionIds")
-
-            if (sessionIds.isEmpty()) {
-                // Dump a useful snippet of the raw output so we can diagnose the format
-                val keywords = listOf("Session", "Track", "Active", "Output thread", "Input thread", "Player", "uid")
-                val relevant = output.lines()
-                    .filter { line -> keywords.any { line.contains(it, ignoreCase = true) } }
-                    .take(40)
-                    .joinToString("\n")
-                val snippet = if (relevant.isNotBlank()) relevant else output.take(2000)
-                updateStatus(
-                    "No active sessions found.\n\n---RELEVANT LINES FROM DUMPSYS---\n$snippet"
-                )
-                return
+            // ── AUDIO MANAGER ──
+            report.appendLine("═══ DUMPSYS AUDIO ═══")
+            if (audioDump.isNullOrBlank()) {
+                report.appendLine("(null/empty)")
+            } else {
+                val lines = audioDump.lines()
+                report.appendLine("${lines.size} lines")
+                report.appendLine("Players (piid/sessionId):")
+                val playerLines = lines.filter {
+                    it.contains("Player piid:", true) ||
+                    (it.contains("sessionId:", true) && it.contains("state:", true))
+                }
+                if (playerLines.isEmpty()) {
+                    report.appendLine("  (none)")
+                } else {
+                    playerLines.take(25).forEach { report.appendLine("  " + it.trim()) }
+                    if (playerLines.size > 25) report.appendLine("  ...(${playerLines.size - 25} more)")
+                }
+                report.appendLine()
+                report.appendLine("All sessionIds mentioned:")
+                val idRegex = Regex("""sessionId[:=]\s*(\d+)""")
+                val allIds = mutableSetOf<Int>()
+                lines.forEach { l -> idRegex.findAll(l).forEach { m ->
+                    m.groupValues[1].toIntOrNull()?.let { if (it > 0) allIds.add(it) }
+                } }
+                report.appendLine("  ${allIds.sorted()}")
             }
 
-            var applied = 0
-            for (id in sessionIds) {
-                if (applyGainToSession(id, -10f)) applied++
-            }
-            updateStatus(
-                "Applied −10 dB to $applied/${sessionIds.size} session(s). Listen for the drop!"
-            )
+            updateStatus(report.toString())
         } catch (t: Throwable) {
-            Log.e(TAG, "PoC fatal", t)
-            updateStatus("PoC exception: ${t.javaClass.simpleName}: ${t.message}")
+            updateStatus("Fatal: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
-    /**
-     * Column-aware parser for the tabular dumpsys media.audio_flinger output.
-     *
-     * Looks for a section starting with "N Tracks of which M are active", reads
-     * the header row to find the positions of "Session", "Active" and "S" columns,
-     * then extracts the Session ID from every data row whose Active column is "yes"
-     * or whose S column is "A".
-     */
     private fun findAllActiveSessionIds(dumpsysOutput: String): List<Int> {
         val sessionIds = mutableListOf<Int>()
         val lines = dumpsysOutput.lines()
-
-        var inTrackSection = false
+        var inSection = false
         var sessionCol = -1
         var activeCol = -1
         var sCol = -1
 
         for (rawLine in lines) {
             val line = rawLine.trim()
-
-            // 1. Section start: "3 Tracks of which 1 are active"
-            if (line.contains("Tracks of which", ignoreCase = true) &&
-                line.contains("are active", ignoreCase = true)
+            if (line.contains("Tracks of which", true) &&
+                line.contains("are active", true)
             ) {
-                val match = Regex("""(\d+)\s+Tracks of which\s+(\d+)\s+are active""")
-                    .find(line)
-                val activeCount = match?.groupValues?.get(2)?.toIntOrNull()
-                inTrackSection = (activeCount != null && activeCount > 0)
-                sessionCol = -1
-                activeCol = -1
-                sCol = -1
+                val m = Regex("""(\d+)\s+Tracks of which\s+(\d+)\s+are active""").find(line)
+                val a = m?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                inSection = a > 0
+                sessionCol = -1; activeCol = -1; sCol = -1
                 continue
             }
-
-            if (!inTrackSection) continue
-
-            // 2. Header row (contains both "Session" and "Active")
+            if (!inSection) continue
             if (sessionCol == -1 &&
-                line.contains("Session", ignoreCase = true) &&
-                line.contains("Active", ignoreCase = true)
+                line.contains("Session", true) &&
+                line.contains("Active", true) &&
+                line.contains("Id", true)
             ) {
                 val headers = line.split(Regex("""\s+"""))
-                sessionCol = headers.indexOfFirst { it.equals("Session", ignoreCase = true) }
-                activeCol = headers.indexOfFirst { it.equals("Active", ignoreCase = true) }
-                sCol = headers.indexOfFirst { it.equals("S", ignoreCase = true) }
+                sessionCol = headers.indexOfFirst { it.equals("Session", true) }
+                activeCol = headers.indexOfFirst { it.equals("Active", true) }
+                sCol = headers.indexOfFirst { it.equals("S", true) }
                 continue
             }
-
-            // 3. Section end: blank line or a new thread block
             if (line.isBlank() ||
-                line.startsWith("Output thread", ignoreCase = true) ||
-                line.startsWith("Input thread", ignoreCase = true)
-            ) {
-                inTrackSection = false
-                continue
-            }
+                line.startsWith("Output thread", true) ||
+                line.startsWith("Input thread", true)
+            ) { inSection = false; continue }
 
-            // 4. Data row
             if (sessionCol >= 0) {
                 val cols = line.split(Regex("""\s+"""))
                 if (cols.size > maxOf(sessionCol, activeCol, sCol)) {
-                    val isActive =
-                        (activeCol >= 0 && cols[activeCol].equals("yes", ignoreCase = true)) ||
-                        (sCol >= 0 && cols[sCol].equals("A", ignoreCase = true))
-                    if (isActive) {
-                        cols[sessionCol].toIntOrNull()?.let { id ->
-                            if (id > 0) sessionIds.add(id)
-                        }
-                    }
+                    val active = (activeCol >= 0 && cols[activeCol].equals("yes", true)) ||
+                                 (sCol >= 0 && cols[sCol].equals("A", true))
+                    if (active) cols[sessionCol].toIntOrNull()?.let { if (it > 0) sessionIds.add(it) }
                 }
             }
         }
-
         return sessionIds.distinct()
     }
 
@@ -176,16 +191,8 @@ class PoCService : Service() {
         return try {
             val config = DynamicsProcessing.Config.Builder(
                 DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                2,
-                true,
-                1,
-                false,
-                0,
-                false,
-                0,
-                false
+                2, true, 1, false, 0, false, 0, false
             ).build()
-
             val effect = DynamicsProcessing(0, sessionId, config)
             effect.setInputGainAllChannelsTo(gainDb)
             effects.add(effect)
@@ -203,35 +210,30 @@ class PoCService : Service() {
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val out = StringBuilder()
             var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                out.append(line).append("\n")
-            }
+            while (reader.readLine().also { line = it } != null) out.append(line).append("\n")
             reader.close()
             process.waitFor()
             out.toString()
         } catch (t: Throwable) {
-            Log.e(TAG, "Shizuku exec failed", t)
-            null
+            Log.e(TAG, "Shizuku exec failed", t); null
         }
     }
 
     private fun newShizukuProcess(command: Array<String>): ShizukuRemoteProcess {
-        val shizukuClass = Class.forName("rikka.shizuku.Shizuku")
-        val method = shizukuClass.getDeclaredMethod(
+        val c = Class.forName("rikka.shizuku.Shizuku")
+        val m = c.getDeclaredMethod(
             "newProcess",
             Array<String>::class.java,
             Array<String>::class.java,
             String::class.java
         )
-        method.isAccessible = true
-        return method.invoke(null, command, null, null) as ShizukuRemoteProcess
+        m.isAccessible = true
+        return m.invoke(null, command, null, null) as ShizukuRemoteProcess
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                CHANNEL_ID, "Volume PoC Service", NotificationManager.IMPORTANCE_LOW
-            )
+            val ch = NotificationChannel(CHANNEL_ID, "Volume PoC", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
         }
     }
@@ -239,14 +241,13 @@ class PoCService : Service() {
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Volume PoC")
-            .setContentText("Applying global gain…")
+            .setContentText("Diagnostic running…")
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
-
     override fun onDestroy() {
         super.onDestroy()
         effects.forEach { runCatching { it.release() } }
