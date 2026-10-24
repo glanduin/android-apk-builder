@@ -1,8 +1,10 @@
 package com.example.sampleapp
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
@@ -10,77 +12,77 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import rikka.shizuku.Shizuku
 
 class MainActivity : AppCompatActivity() {
 
-    private val SHIZUKU_PERMISSION_REQUEST_CODE = 1001
-    private val NOTIFICATION_PERMISSION_REQUEST_CODE = 1002
+    private val RECORD_AUDIO_PERMISSION_REQUEST = 1001
+    private val NOTIFICATION_PERMISSION_REQUEST = 1002
+    private val MEDIA_PROJECTION_REQUEST = 1003
 
     private lateinit var statusText: TextView
+    private lateinit var mediaProjectionManager: MediaProjectionManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
-        statusText.text = PoCService.currentStatus
+        statusText.text = AudioCaptureService.currentStatus
 
-        PoCService.statusCallback = { msg ->
+        AudioCaptureService.statusCallback = { msg ->
             runOnUiThread { statusText.text = msg }
         }
 
-        findViewById<Button>(R.id.startButton).setOnClickListener {
-            try {
-                handleClick()
-            } catch (t: Throwable) {
-                statusText.text = "CRASH CAUGHT:\n${t.javaClass.simpleName}: ${t.message}"
+        mediaProjectionManager =
+            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        findViewById<Button>(R.id.startButton).apply {
+            text = "Start Audio Capture"
+            setOnClickListener {
+                try {
+                    startFlow()
+                } catch (t: Throwable) {
+                    statusText.text = "Error:\n${t.javaClass.simpleName}: ${t.message}"
+                }
             }
         }
 
         requestNotificationPermissionIfNeeded()
+        requestRecordAudioPermissionIfNeeded()
     }
 
-    private fun handleClick() {
-        if (!Shizuku.pingBinder()) {
-            statusText.text = "Shizuku binder is not alive.\nOpen Shizuku app and start the service, then try again."
+    private fun startFlow() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            statusText.text = "Recording permission missing. Grant it and try again."
+            requestRecordAudioPermissionIfNeeded()
             return
         }
-        if (Shizuku.isPreV11()) {
-            statusText.text = "Shizuku version too old (pre-v11). Update Shizuku."
+
+        statusText.text = "Requesting screen-capture permission…"
+        val intent = mediaProjectionManager.createScreenCaptureIntent()
+        @Suppress("DEPRECATION")
+        startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
+    }
+
+    @Deprecated("Uses legacy onActivityResult; fine for a PoC")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode != MEDIA_PROJECTION_REQUEST) return
+
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            statusText.text = "Screen-capture permission DENIED."
             return
         }
-        if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-            startPoCService()
-        } else {
-            statusText.text = "Requesting Shizuku permission…"
-            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
-        }
-    }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                startPoCService()
-            } else {
-                statusText.text = "Shizuku permission denied."
-            }
+        val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
+            action = AudioCaptureService.ACTION_START
+            putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
         }
-    }
-
-    private fun startPoCService() {
-        try {
-            val intent = Intent(this, PoCService::class.java)
-            ContextCompat.startForegroundService(this, intent)
-            statusText.text = "Service starting…"
-        } catch (t: Throwable) {
-            statusText.text = "Failed to start service:\n${t.javaClass.simpleName}: ${t.message}"
-        }
+        ContextCompat.startForegroundService(this, serviceIntent)
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -91,14 +93,26 @@ class MainActivity : AppCompatActivity() {
                 ActivityCompat.requestPermissions(
                     this,
                     arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    NOTIFICATION_PERMISSION_REQUEST_CODE
+                    NOTIFICATION_PERMISSION_REQUEST
                 )
             }
         }
     }
 
+    private fun requestRecordAudioPermissionIfNeeded() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                RECORD_AUDIO_PERMISSION_REQUEST
+            )
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        PoCService.statusCallback = null
+        AudioCaptureService.statusCallback = null
     }
 }
