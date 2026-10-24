@@ -19,9 +19,11 @@ class MainActivity : AppCompatActivity() {
     private val RECORD_AUDIO_PERMISSION_REQUEST = 1001
     private val NOTIFICATION_PERMISSION_REQUEST = 1002
     private val MEDIA_PROJECTION_REQUEST = 1003
+    private val MAX_GAIN = 20f
 
     private lateinit var statusText: TextView
     private lateinit var gainLabel: TextView
+    private lateinit var gainSeek: SeekBar
     private lateinit var mediaProjectionManager: MediaProjectionManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -30,28 +32,39 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         gainLabel = findViewById(R.id.gainLabel)
+        gainSeek = findViewById(R.id.gainSeek)
         mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         AudioCaptureService.statusCallback = { msg -> runOnUiThread { statusText.text = msg } }
 
-        findViewById<SeekBar>(R.id.gainSeek).apply {
-            progress = 100
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                    gainLabel.text = "Gain: $progress%"
-                    AudioCaptureService.gain = progress / 100f
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
+        // Listen for gain changes coming FROM the service (fallback auto-boost)
+        AudioCaptureService.gainUpdateCallback = { g ->
+            runOnUiThread {
+                val progress = ((g / MAX_GAIN) * 100).toInt().coerceIn(0, 100)
+                if (gainSeek.progress != progress) gainSeek.progress = progress
+            }
         }
+
+        gainSeek.max = 100
+        gainSeek.progress = 5                     // 1.0× — safe default if volume 0 gives full signal
+        AudioCaptureService.gain = 1f
+        gainLabel.text = "Gain: 5%  (1.0×)"
+
+        gainSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                val g = progress / 100f * MAX_GAIN
+                gainLabel.text = "Gain: $progress%  (${"%.1f".format(g)}×)"
+                AudioCaptureService.gain = g
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
 
         findViewById<Button>(R.id.startButton).setOnClickListener { startFlow() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
-            val si = Intent(this, AudioCaptureService::class.java).apply {
+            startService(Intent(this, AudioCaptureService::class.java).apply {
                 action = AudioCaptureService.ACTION_STOP
-            }
-            startService(si)
+            })
         }
 
         requestNotificationPermissionIfNeeded()
@@ -69,9 +82,8 @@ class MainActivity : AppCompatActivity() {
             statusText.text = "Shizuku is not running. Start Shizuku first."
             return
         }
-        val intent = mediaProjectionManager.createScreenCaptureIntent()
         @Suppress("DEPRECATION")
-        startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
+        startActivityForResult(mediaProjectionManager.createScreenCaptureIntent(), MEDIA_PROJECTION_REQUEST)
     }
 
     @Deprecated("legacy")
@@ -111,5 +123,6 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         AudioCaptureService.statusCallback = null
+        AudioCaptureService.gainUpdateCallback = null
     }
 }
