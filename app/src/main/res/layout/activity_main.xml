@@ -5,20 +5,47 @@
     android:orientation="vertical"
     android:padding="16dp">
 
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="MediaController Volume Test"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <Button
+        android:id="@+id/attachButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="1. Attach to Musicolet" />
+
+    <SeekBar
+        android:id="@+id/volumeSeek"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:max="100"
+        android:progress="100" />
+
+    <TextView
+        android:id="@+id/volumeLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="2. Drag slider — Volume: 100%"
+        android:textSize="14sp" />
+
     <Button
         android:id="@+id/startButton"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="center_horizontal"
-        android:text="Start Global Volume PoC" />
+        android:layout_marginTop="16dp"
+        android:text="(Old) Start Audio Capture" />
 
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:layout_marginTop="16dp"
-        android:background="#10000000"
-        android:padding="8dp">
+        android:layout_marginTop="16dp">
 
         <TextView
             android:id="@+id/statusText"
