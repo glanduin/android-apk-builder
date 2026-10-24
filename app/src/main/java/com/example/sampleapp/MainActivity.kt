@@ -5,9 +5,13 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Button
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -20,7 +24,10 @@ class MainActivity : AppCompatActivity() {
     private val MEDIA_PROJECTION_REQUEST = 1003
 
     private lateinit var statusText: TextView
+    private lateinit var volumeLabel: TextView
+    private lateinit var volumeSeek: SeekBar
     private lateinit var mediaProjectionManager: MediaProjectionManager
+    private var mediaController: MediaController? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -28,91 +35,135 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         statusText.text = AudioCaptureService.currentStatus
+        AudioCaptureService.statusCallback = { msg -> runOnUiThread { statusText.text = msg } }
 
-        AudioCaptureService.statusCallback = { msg ->
-            runOnUiThread { statusText.text = msg }
-        }
+        volumeLabel = findViewById(R.id.volumeLabel)
+        volumeSeek = findViewById(R.id.volumeSeek)
 
-        mediaProjectionManager =
-            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        findViewById<Button>(R.id.startButton).apply {
-            text = "Start Audio Capture"
-            setOnClickListener {
-                try {
-                    startFlow()
-                } catch (t: Throwable) {
-                    statusText.text = "Error:\n${t.javaClass.simpleName}: ${t.message}"
-                }
+        volumeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                volumeLabel.text = "Volume: $progress%"
+                if (fromUser) applyMediaControllerVolume(progress / 100f)
             }
-        }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+
+        findViewById<Button>(R.id.attachButton).setOnClickListener { attachToMusicolet() }
+        findViewById<Button>(R.id.startButton).setOnClickListener { startCaptureFlow() }
 
         requestNotificationPermissionIfNeeded()
         requestRecordAudioPermissionIfNeeded()
+
+        if (!isNotificationListenerEnabled()) {
+            statusText.text = "Notification Listener NOT enabled.\n" +
+                "Enable: Settings → Notifications → Special app access → " +
+                "Notification access → Volume PoC → Allow.\n\n" +
+                "Then play music in Musicolet and tap 'Attach'."
+        } else {
+            statusText.text = "Ready.\nPlay music in Musicolet, tap 'Attach', then drag the slider."
+        }
     }
 
-    private fun startFlow() {
+    private fun attachToMusicolet() {
+        if (!isNotificationListenerEnabled()) {
+            statusText.text = "Notification Listener not enabled.\n" +
+                "Settings → Notifications → Special app access → " +
+                "Notification access → Volume PoC → Allow."
+            return
+        }
+        try {
+            val msm = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val sessions = msm.getActiveSessions(null)
+            val pkgList = sessions.joinToString(", ") { it.packageName }
+            val musicolet = sessions.find { it.packageName == "in.krosbits.musicolet" }
+            if (musicolet == null) {
+                statusText.text = "No Musicolet session.\nActive sessions: [$pkgList]\n" +
+                    "Start music in Musicolet, then tap Attach again."
+                return
+            }
+            mediaController = MediaController(this, musicolet.sessionToken)
+            val pb = mediaController?.playbackInfo
+            statusText.text = "✓ Attached to in.krosbits.musicolet\n" +
+                "volume=${pb?.currentVolume} / max=${pb?.maxVolume}\n" +
+                "Drag the slider to test."
+        } catch (t: Throwable) {
+            statusText.text = "attach failed: ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    private fun applyMediaControllerVolume(volume: Float) {
+        val ctrl = mediaController
+        if (ctrl == null) {
+            statusText.text = "No controller. Tap 'Attach to Musicolet' first."
+            return
+        }
+        try {
+            ctrl.setVolume(volume)
+            val newVol = ctrl.playbackInfo?.currentVolume
+            statusText.text = "setVolume($volume) → reported volume: $newVol"
+        } catch (t: Throwable) {
+            statusText.text = "setVolume failed: ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    private fun isNotificationListenerEnabled(): Boolean {
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return flat.contains(packageName)
+    }
+
+    private fun startCaptureFlow() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            statusText.text = "Recording permission missing. Grant it and try again."
+            != PackageManager.PERMISSION_GRANTED) {
+            statusText.text = "Recording permission missing."
             requestRecordAudioPermissionIfNeeded()
             return
         }
-
-        statusText.text = "Requesting screen-capture permission…"
         val intent = mediaProjectionManager.createScreenCaptureIntent()
         @Suppress("DEPRECATION")
         startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
     }
 
-    @Deprecated("Uses legacy onActivityResult; fine for a PoC")
+    @Deprecated("legacy")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-
         if (requestCode != MEDIA_PROJECTION_REQUEST) return
-
         if (resultCode != Activity.RESULT_OK || data == null) {
             statusText.text = "Screen-capture permission DENIED."
             return
         }
-
-        val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
+        val si = Intent(this, AudioCaptureService::class.java).apply {
             action = AudioCaptureService.ACTION_START
             putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
         }
-        ContextCompat.startForegroundService(this, serviceIntent)
+        ContextCompat.startForegroundService(this, si)
     }
 
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    NOTIFICATION_PERMISSION_REQUEST
-                )
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
             }
         }
     }
 
     private fun requestRecordAudioPermissionIfNeeded() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                RECORD_AUDIO_PERMISSION_REQUEST
-            )
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_PERMISSION_REQUEST)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         AudioCaptureService.statusCallback = null
+        mediaController = null
     }
 }
