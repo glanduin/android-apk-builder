@@ -1,121 +1,115 @@
 package com.example.sampleapp
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import rikka.shizuku.Shizuku
-import rikka.shizuku.ShizukuRemoteProcess
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 class MainActivity : AppCompatActivity() {
 
-    private val TAG = "ShellMuteTest"
+    private val RECORD_AUDIO_PERMISSION_REQUEST = 1001
     private val NOTIFICATION_PERMISSION_REQUEST = 1002
+    private val MEDIA_PROJECTION_REQUEST = 1003
 
     private lateinit var statusText: TextView
+    private lateinit var gainLabel: TextView
+    private lateinit var mediaProjectionManager: MediaProjectionManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
-        statusText.text = "Shizuku binder alive: ${Shizuku.pingBinder()}\n\n" +
-            "Start music in Musicolet, then tap one button at a time.\n" +
-            "After each tap, LISTEN: did the music drop to silence or get quieter?\n\n" +
-            "Report back which buttons worked (if any)."
+        gainLabel = findViewById(R.id.gainLabel)
+        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        findViewById<Button>(R.id.cmdMediaSession).setOnClickListener {
-            runShellTest("cmd media_session volume --stream 3 --set 0")
+        AudioCaptureService.statusCallback = { msg -> runOnUiThread { statusText.text = msg } }
+
+        findViewById<SeekBar>(R.id.gainSeek).apply {
+            progress = 100
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    gainLabel.text = "Gain: $progress%"
+                    AudioCaptureService.gain = progress / 100f
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
         }
-        findViewById<Button>(R.id.cmdAudio).setOnClickListener {
-            runShellTest("cmd audio set-volume --stream 3 --index 0")
-        }
-        findViewById<Button>(R.id.cmdSettings).setOnClickListener {
-            runShellTest("settings put system volume_music 0")
-        }
-        findViewById<Button>(R.id.cmdServiceCall).setOnClickListener {
-            // Raw binder: setStreamVolume(stream=3, index=0, flags=0, callingPackage=null, uid=2000)
-            runShellTest("service call audio 10 i32 3 i32 0 i32 0 i32 0 s16 com.android.shell i32 2000")
+
+        findViewById<Button>(R.id.startButton).setOnClickListener { startFlow() }
+        findViewById<Button>(R.id.stopButton).setOnClickListener {
+            val si = Intent(this, AudioCaptureService::class.java).apply {
+                action = AudioCaptureService.ACTION_STOP
+            }
+            startService(si)
         }
 
         requestNotificationPermissionIfNeeded()
+        requestRecordAudioPermissionIfNeeded()
     }
 
-    private fun runShellTest(command: String) {
-        if (!Shizuku.pingBinder()) {
-            statusText.text = "Shizuku binder not alive. Start Shizuku first."
+    private fun startFlow() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            statusText.text = "Recording permission missing."
+            requestRecordAudioPermissionIfNeeded()
             return
         }
-        statusText.text = "Running:\n$command\n\nWaiting for result…"
-        Thread {
-            try {
-                val args = command.split(" ").toTypedArray()
-                val proc = newShizukuProcess(args)
-
-                val out = BufferedReader(InputStreamReader(proc.inputStream))
-                    .bufferedLines()
-                val err = BufferedReader(InputStreamReader(proc.errorStream))
-                    .bufferedLines()
-                val exit = proc.waitFor()
-
-                val report = buildString {
-                    appendLine("Command:")
-                    appendLine(command)
-                    appendLine()
-                    appendLine("exit = $exit")
-                    appendLine()
-                    appendLine("stdout:")
-                    appendLine(if (out.isBlank()) "(empty)" else out)
-                    appendLine()
-                    appendLine("stderr:")
-                    appendLine(if (err.isBlank()) "(empty)" else err)
-                    appendLine()
-                    appendLine("▶ Did the music drop / go quieter? Note which button, then report back.")
-                }
-
-                runOnUiThread { statusText.text = report }
-            } catch (t: Throwable) {
-                runOnUiThread {
-                    statusText.text = "Exception running:\n$command\n\n" +
-                        "${t.javaClass.simpleName}: ${t.message}"
-                }
-            }
-        }.start()
+        if (!rikka.shizuku.Shizuku.pingBinder()) {
+            statusText.text = "Shizuku is not running. Start Shizuku first."
+            return
+        }
+        val intent = mediaProjectionManager.createScreenCaptureIntent()
+        @Suppress("DEPRECATION")
+        startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
     }
 
-    private fun BufferedReader.bufferedLines(): String =
-        useLines { it.joinToString("\n") }
-
-    private fun newShizukuProcess(command: Array<String>): ShizukuRemoteProcess {
-        val c = Class.forName("rikka.shizuku.Shizuku")
-        val m = c.getDeclaredMethod(
-            "newProcess",
-            Array<String>::class.java,
-            Array<String>::class.java,
-            String::class.java
-        )
-        m.isAccessible = true
-        return m.invoke(null, command, null, null) as ShizukuRemoteProcess
+    @Deprecated("legacy")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != MEDIA_PROJECTION_REQUEST) return
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            statusText.text = "Screen-capture permission denied."
+            return
+        }
+        val si = Intent(this, AudioCaptureService::class.java).apply {
+            action = AudioCaptureService.ACTION_START
+            putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
+        }
+        ContextCompat.startForegroundService(this, si)
     }
 
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    NOTIFICATION_PERMISSION_REQUEST
-                )
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
             }
         }
+    }
+
+    private fun requestRecordAudioPermissionIfNeeded() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_PERMISSION_REQUEST)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        AudioCaptureService.statusCallback = null
     }
 }
