@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.media.audiofx.DynamicsProcessing
+import android.media.audiofx.LoudnessEnhancer
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -23,7 +24,8 @@ class PoCService : Service() {
         var currentStatus: String = "Idle"
     }
 
-    private val effects = mutableListOf<DynamicsProcessing>()
+    private val dpEffects = mutableListOf<DynamicsProcessing>()
+    private val leEffects = mutableListOf<LoudnessEnhancer>()
 
     override fun onCreate() {
         super.onCreate()
@@ -50,53 +52,39 @@ class PoCService : Service() {
     private fun runPoC() {
         try {
             val report = StringBuilder()
-            updateStatus("Running dumpsys…")
+            updateStatus("Attaching effect to GLOBAL mix (session 0)…")
 
-            val flingerDump = runShizukuCommandWithOutput(arrayOf("dumpsys", "media.audio_flinger"))
-            if (flingerDump.isNullOrBlank()) {
-                updateStatus("dumpsys media.audio_flinger returned nothing.")
-                return
+            // Release previous effects
+            dpEffects.forEach { runCatching { it.release() } }
+            dpEffects.clear()
+            leEffects.forEach { runCatching { it.release() } }
+            leEffects.clear()
+
+            val gainDb = -10f
+
+            // ── PRIMARY: DynamicsProcessing on session 0 ──
+            val dpOk = tryAttachDp(0, gainDb)
+            if (dpOk) {
+                report.appendLine("✓ DynamicsProcessing on session 0")
+            } else {
+                report.appendLine("✗ DynamicsProcessing on session 0 FAILED")
             }
 
-            // PRIMARY: Global session refs — the authoritative source
-            val fromRefs = parseGlobalSessionRefs(flingerDump)
-            report.appendLine("Global session refs found: $fromRefs")
-
-            // FALLBACK: track tables
-            val fromTracks = parseTrackTables(flingerDump)
-            report.appendLine("Track tables found: $fromTracks")
-
-            val targets = (fromRefs + fromTracks).distinct()
-            report.appendLine("Targeting: $targets")
-            report.appendLine()
-
-            if (targets.isEmpty()) {
-                updateStatus("$report\nNo sessions to target.\nMake sure music is playing.")
-                return
-            }
-
-            // Release any previous effects so we can re-attach cleanly
-            effects.forEach { runCatching { it.release() } }
-            effects.clear()
-
-            var ok = 0
-            var fail = 0
-            for (id in targets) {
-                if (tryAttach(id, -10f)) {
-                    ok++
-                    report.appendLine("✓ session $id  (−10 dB)")
+            // ── FALLBACK: LoudnessEnhancer on session 0 ──
+            if (!dpOk) {
+                val leOk = tryAttachLe(0, gainDb)
+                if (leOk) {
+                    report.appendLine("✓ LoudnessEnhancer on session 0 (fallback)")
                 } else {
-                    fail++
-                    report.appendLine("✗ session $id  attach FAILED")
+                    report.appendLine("✗ LoudnessEnhancer on session 0 FAILED")
                 }
             }
+
             report.appendLine()
-            report.appendLine("Attached: $ok  /  Failed: $fail")
-            if (ok > 0) {
-                report.appendLine()
-                report.appendLine("▶ Listen for the volume drop NOW.")
-                report.appendLine("Tap again to re-attach if it didn't take effect.")
-            }
+            report.appendLine("▶ Listen for the volume drop NOW.")
+            report.appendLine("If it worked, this proves the global-mix approach.")
+            report.appendLine("If it did NOT work, Funtouch is bypassing")
+            report.appendLine("effects on the global mix entirely.")
 
             updateStatus(report.toString())
         } catch (t: Throwable) {
@@ -104,155 +92,45 @@ class PoCService : Service() {
         }
     }
 
-    /**
-     * Parses the "Global session refs:" block, which lists every audio session
-     * currently held by any app in AudioFlinger.
-     *
-     * Example format:
-     *   Global session refs:
-     *     session  cnt   pid    uid  name
-     *     1713     2     9469   10212  in.krosbits.musicolet
-     */
-    private fun parseGlobalSessionRefs(output: String): List<Int> {
-        val sessions = mutableListOf<Int>()
-        val lines = output.lines()
-        var inRefs = false
-        var headerSeen = false
-
-        for (line in lines) {
-            val t = line.trim()
-            if (t.startsWith("Global session refs", true)) {
-                inRefs = true
-                headerSeen = false
-                continue
-            }
-            if (!inRefs) continue
-            if (t.startsWith("Output thread", true) ||
-                t.startsWith("Input thread", true) ||
-                t.startsWith("Hardware status", true) ||
-                t.startsWith("Standby Time", true) ||
-                t.startsWith("mHifiState", true) ||
-                t.startsWith("mLowPower", true)
-            ) break
-
-            if (t.startsWith("session", true) && t.contains("cnt", true)) {
-                headerSeen = true
-                continue
-            }
-            if (headerSeen && t.isNotEmpty()) {
-                val parts = t.split(Regex("""\s+"""))
-                if (parts.size >= 5) {
-                    parts[0].toIntOrNull()?.let { if (it > 0) sessions.add(it) }
-                }
-            }
-        }
-        return sessions.distinct()
-    }
-
-    private fun parseTrackTables(output: String): List<Int> {
-        val sessions = mutableListOf<Int>()
-        val lines = output.lines()
-        var inSection = false
-        var sessionCol = -1
-        var activeCol = -1
-        var sCol = -1
-
-        for (line in lines) {
-            val t = line.trim()
-            if (t.contains("Tracks of which", true) && t.contains("are active", true)) {
-                val m = Regex("""(\d+)\s+Tracks of which\s+(\d+)\s+are active""").find(t)
-                val a = m?.groupValues?.get(2)?.toIntOrNull() ?: 0
-                inSection = a > 0
-                sessionCol = -1; activeCol = -1; sCol = -1
-                continue
-            }
-            if (!inSection) continue
-            if (sessionCol == -1 &&
-                t.contains("Session", true) &&
-                t.contains("Active", true) &&
-                t.contains("Id", true)
-            ) {
-                val headers = t.split(Regex("""\s+"""))
-                sessionCol = headers.indexOfFirst { it.equals("Session", true) }
-                activeCol = headers.indexOfFirst { it.equals("Active", true) }
-                sCol = headers.indexOfFirst { it.equals("S", true) }
-                continue
-            }
-            if (t.isBlank() ||
-                t.startsWith("Output thread", true) ||
-                t.startsWith("Input thread", true)
-            ) { inSection = false; continue }
-
-            if (sessionCol >= 0) {
-                val cols = t.split(Regex("""\s+"""))
-                if (cols.size > maxOf(sessionCol, activeCol, sCol)) {
-                    val active =
-                        (activeCol >= 0 && cols[activeCol].equals("yes", true)) ||
-                        (sCol >= 0 && cols[sCol].equals("A", true))
-                    if (active) {
-                        cols[sessionCol].toIntOrNull()?.let { if (it > 0) sessions.add(it) }
-                    }
-                }
-            }
-        }
-        return sessions.distinct()
-    }
-
-    private fun tryAttach(sessionId: Int, gainDb: Float): Boolean {
+    private fun tryAttachDp(sessionId: Int, gainDb: Float): Boolean {
         return try {
             val config = DynamicsProcessing.Config.Builder(
                 DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                2,      // stereo
-                true,   // pre-EQ used
-                1,      // 1 pre-EQ band
-                false,  // no MBC
+                2,
+                true,
+                1,
+                false,
                 0,
-                false,  // no post-EQ
+                false,
                 0,
-                false   // no limiter
+                false
             ).build()
 
             val effect = DynamicsProcessing(0, sessionId, config)
             effect.setInputGainAllChannelsTo(gainDb)
-
-            // Verify the effect actually got enabled
-            if (!effect.enabled) {
-                Log.w(TAG, "Effect attached to $sessionId but not enabled")
-            }
-            effects.add(effect)
-            Log.d(TAG, "Attached $gainDb dB to session $sessionId (enabled=${effect.enabled})")
+            dpEffects.add(effect)
+            Log.d(TAG, "DP attached to session $sessionId, enabled=${effect.enabled}")
             true
         } catch (t: Throwable) {
-            Log.e(TAG, "Attach failed for session $sessionId: ${t.javaClass.simpleName}: ${t.message}", t)
+            Log.e(TAG, "DP attach failed for $sessionId: ${t.message}", t)
             false
         }
     }
 
-    private fun runShizukuCommandWithOutput(command: Array<String>): String? {
+    private fun tryAttachLe(sessionId: Int, gainDb: Float): Boolean {
         return try {
-            val process = newShizukuProcess(command)
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val out = StringBuilder()
-            var line: String?
-            while (reader.readLine().also { line = it } != null) out.append(line).append("\n")
-            reader.close()
-            process.waitFor()
-            out.toString()
+            val le = LoudnessEnhancer(sessionId)
+            // LoudnessEnhancer takes gain in millibels (mB).
+            // Negative values attenuate; the effective range is roughly -1000 to +1000.
+            le.setTargetGain((gainDb * 100).toInt())
+            le.enabled = true
+            leEffects.add(le)
+            Log.d(TAG, "LE attached to session $sessionId, enabled=${le.enabled}")
+            true
         } catch (t: Throwable) {
-            Log.e(TAG, "Shizuku exec failed", t); null
+            Log.e(TAG, "LE attach failed for $sessionId: ${t.message}", t)
+            false
         }
-    }
-
-    private fun newShizukuProcess(command: Array<String>): ShizukuRemoteProcess {
-        val c = Class.forName("rikka.shizuku.Shizuku")
-        val m = c.getDeclaredMethod(
-            "newProcess",
-            Array<String>::class.java,
-            Array<String>::class.java,
-            String::class.java
-        )
-        m.isAccessible = true
-        return m.invoke(null, command, null, null) as ShizukuRemoteProcess
     }
 
     private fun createNotificationChannel() {
@@ -265,7 +143,7 @@ class PoCService : Service() {
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Volume PoC")
-            .setContentText("Attaching effects…")
+            .setContentText("Applying global mix gain…")
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -275,7 +153,9 @@ class PoCService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        effects.forEach { runCatching { it.release() } }
-        effects.clear()
+        dpEffects.forEach { runCatching { it.release() } }
+        dpEffects.clear()
+        leEffects.forEach { runCatching { it.release() } }
+        leEffects.clear()
     }
 }
