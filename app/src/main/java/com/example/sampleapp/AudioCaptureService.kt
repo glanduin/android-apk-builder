@@ -16,6 +16,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
@@ -88,10 +89,13 @@ class AudioCaptureService : Service() {
             return
         }
 
+        // ─── KEY FIX #1: exclude our own UID from capture ───
+        // Otherwise our AudioTrack output gets captured and replayed forever.
         val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .excludeUid(Process.myUid())
             .build()
 
         val sampleRate = 44100
@@ -124,13 +128,17 @@ class AudioCaptureService : Service() {
         }
         audioRecord = record
 
+        // ─── KEY FIX #2: mark our output as non-capturable ───
+        // Belt-and-suspenders: even without the UID exclusion above, our
+        // replay track will never be captured because we tag it as such.
+        val outAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_NONE)
+            .build()
+
         val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
+            .setAudioAttributes(outAttributes)
             .setAudioFormat(
                 AudioFormat.Builder()
                     .setEncoding(encoding)
@@ -153,7 +161,7 @@ class AudioCaptureService : Service() {
         isCapturing = true
         record.startRecording()
         track.play()
-        updateStatus("Capturing. You should hear delayed audio within ~1 second.")
+        updateStatus("Capturing. You should hear delayed audio within ~1 second.\n(No loop: our own output is excluded.)")
 
         captureThread = thread(name = "capture-loop") {
             val buffer = ShortArray(minBufBytes / 2)
@@ -162,7 +170,8 @@ class AudioCaptureService : Service() {
                 val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
                 if (read > 0) {
                     // Phase 1: pass through unchanged.
-                    // Phase 2 will multiply buffer[i] by a gain factor here.
+                    // Phase 2 will apply gain here:
+                    //   for (i in 0 until read) buffer[i] = (buffer[i] * gain).toInt().toShort()
                     audioTrack?.write(buffer, 0, read)
                     totalRead += read
                 } else if (read < 0) {
