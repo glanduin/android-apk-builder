@@ -1,179 +1,121 @@
 package com.example.sampleapp
 
 import android.Manifest
-import android.app.Activity
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.media.projection.MediaProjectionManager
-import android.media.session.MediaController
-import android.media.session.MediaSessionManager
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
+import android.util.Log
 import android.widget.Button
-import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuRemoteProcess
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
 class MainActivity : AppCompatActivity() {
 
-    private val RECORD_AUDIO_PERMISSION_REQUEST = 1001
+    private val TAG = "ShellMuteTest"
     private val NOTIFICATION_PERMISSION_REQUEST = 1002
-    private val MEDIA_PROJECTION_REQUEST = 1003
 
     private lateinit var statusText: TextView
-    private lateinit var volumeLabel: TextView
-    private lateinit var volumeSeek: SeekBar
-    private lateinit var mediaProjectionManager: MediaProjectionManager
-    private var mediaController: MediaController? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
-        statusText.text = AudioCaptureService.currentStatus
-        AudioCaptureService.statusCallback = { msg -> runOnUiThread { statusText.text = msg } }
+        statusText.text = "Shizuku binder alive: ${Shizuku.pingBinder()}\n\n" +
+            "Start music in Musicolet, then tap one button at a time.\n" +
+            "After each tap, LISTEN: did the music drop to silence or get quieter?\n\n" +
+            "Report back which buttons worked (if any)."
 
-        volumeLabel = findViewById(R.id.volumeLabel)
-        volumeSeek = findViewById(R.id.volumeSeek)
-
-        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-
-        volumeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                volumeLabel.text = "Slider: $progress%"
-                if (fromUser) applyVolume(progress)
-            }
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) {}
-        })
-
-        findViewById<Button>(R.id.attachButton).setOnClickListener { attachToMusicolet() }
-        findViewById<Button>(R.id.startButton).setOnClickListener { startCaptureFlow() }
+        findViewById<Button>(R.id.cmdMediaSession).setOnClickListener {
+            runShellTest("cmd media_session volume --stream 3 --set 0")
+        }
+        findViewById<Button>(R.id.cmdAudio).setOnClickListener {
+            runShellTest("cmd audio set-volume --stream 3 --index 0")
+        }
+        findViewById<Button>(R.id.cmdSettings).setOnClickListener {
+            runShellTest("settings put system volume_music 0")
+        }
+        findViewById<Button>(R.id.cmdServiceCall).setOnClickListener {
+            // Raw binder: setStreamVolume(stream=3, index=0, flags=0, callingPackage=null, uid=2000)
+            runShellTest("service call audio 10 i32 3 i32 0 i32 0 i32 0 s16 com.android.shell i32 2000")
+        }
 
         requestNotificationPermissionIfNeeded()
-        requestRecordAudioPermissionIfNeeded()
-
-        if (!isNotificationListenerEnabled()) {
-            statusText.text = "Notification Listener NOT enabled.\n" +
-                "Enable: Settings → Notifications → Special app access → " +
-                "Notification access → Volume PoC → Allow.\n\n" +
-                "Then play music in Musicolet and tap 'Attach'."
-        } else {
-            statusText.text = "Ready.\nPlay music in Musicolet, tap 'Attach', then drag the slider."
-        }
     }
 
-    private fun attachToMusicolet() {
-        if (!isNotificationListenerEnabled()) {
-            statusText.text = "Notification Listener not enabled.\n" +
-                "Settings → Notifications → Special app access → " +
-                "Notification access → Volume PoC → Allow."
+    private fun runShellTest(command: String) {
+        if (!Shizuku.pingBinder()) {
+            statusText.text = "Shizuku binder not alive. Start Shizuku first."
             return
         }
-        try {
-            val msm = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
-            val sessions = msm.getActiveSessions(null)
-            val pkgList = sessions.joinToString(", ") { it.packageName }
-            val musicolet = sessions.find { it.packageName == "in.krosbits.musicolet" }
-            if (musicolet == null) {
-                statusText.text = "No Musicolet session.\nActive sessions: [$pkgList]\n" +
-                    "Start music in Musicolet, then tap Attach again."
-                return
+        statusText.text = "Running:\n$command\n\nWaiting for result…"
+        Thread {
+            try {
+                val args = command.split(" ").toTypedArray()
+                val proc = newShizukuProcess(args)
+
+                val out = BufferedReader(InputStreamReader(proc.inputStream))
+                    .bufferedLines()
+                val err = BufferedReader(InputStreamReader(proc.errorStream))
+                    .bufferedLines()
+                val exit = proc.waitFor()
+
+                val report = buildString {
+                    appendLine("Command:")
+                    appendLine(command)
+                    appendLine()
+                    appendLine("exit = $exit")
+                    appendLine()
+                    appendLine("stdout:")
+                    appendLine(if (out.isBlank()) "(empty)" else out)
+                    appendLine()
+                    appendLine("stderr:")
+                    appendLine(if (err.isBlank()) "(empty)" else err)
+                    appendLine()
+                    appendLine("▶ Did the music drop / go quieter? Note which button, then report back.")
+                }
+
+                runOnUiThread { statusText.text = report }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    statusText.text = "Exception running:\n$command\n\n" +
+                        "${t.javaClass.simpleName}: ${t.message}"
+                }
             }
-            mediaController = MediaController(this, musicolet.sessionToken)
-            val pb = mediaController?.playbackInfo
-            statusText.text = "✓ Attached to in.krosbits.musicolet\n" +
-                "currentVolume=${pb?.currentVolume}  maxVolume=${pb?.maxVolume}\n\n" +
-                "Drag the slider. If maxVolume is a big number (e.g. 100+), " +
-                "Musicolet handles its own volume and we get fine-grained steps for free."
-        } catch (t: Throwable) {
-            statusText.text = "attach failed: ${t.javaClass.simpleName}: ${t.message}"
-        }
+        }.start()
     }
 
-    private fun applyVolume(progressPercent: Int) {
-        val ctrl = mediaController
-        if (ctrl == null) {
-            statusText.text = "No controller. Tap 'Attach to Musicolet' first."
-            return
-        }
-        try {
-            val info = ctrl.playbackInfo
-            val maxVol = info?.maxVolume?.takeIf { it > 0 } ?: 100
-            val targetVol = (progressPercent.toFloat() / 100f * maxVol)
-                .toInt()
-                .coerceIn(0, maxVol)
+    private fun BufferedReader.bufferedLines(): String =
+        useLines { it.joinToString("\n") }
 
-            // The correct MediaController volume API: index-based, not float.
-            ctrl.setVolumeTo(targetVol, 0)
-
-            val after = ctrl.playbackInfo
-            statusText.text =
-                "setVolumeTo($targetVol) → reported: ${after?.currentVolume} / $maxVol"
-        } catch (t: Throwable) {
-            statusText.text = "setVolumeTo failed: ${t.javaClass.simpleName}: ${t.message}"
-        }
-    }
-
-    private fun isNotificationListenerEnabled(): Boolean {
-        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
-            ?: return false
-        return flat.contains(packageName)
-    }
-
-    private fun startCaptureFlow() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            statusText.text = "Recording permission missing."
-            requestRecordAudioPermissionIfNeeded()
-            return
-        }
-        val intent = mediaProjectionManager.createScreenCaptureIntent()
-        @Suppress("DEPRECATION")
-        startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
-    }
-
-    @Deprecated("legacy")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != MEDIA_PROJECTION_REQUEST) return
-        if (resultCode != Activity.RESULT_OK || data == null) {
-            statusText.text = "Screen-capture permission DENIED."
-            return
-        }
-        val si = Intent(this, AudioCaptureService::class.java).apply {
-            action = AudioCaptureService.ACTION_START
-            putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
-            putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
-        }
-        ContextCompat.startForegroundService(this, si)
+    private fun newShizukuProcess(command: Array<String>): ShizukuRemoteProcess {
+        val c = Class.forName("rikka.shizuku.Shizuku")
+        val m = c.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java
+        )
+        m.isAccessible = true
+        return m.invoke(null, command, null, null) as ShizukuRemoteProcess
     }
 
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    NOTIFICATION_PERMISSION_REQUEST
+                )
             }
         }
-    }
-
-    private fun requestRecordAudioPermissionIfNeeded() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this,
-                arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_PERMISSION_REQUEST)
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        AudioCaptureService.statusCallback = null
-        mediaController = null
     }
 }
