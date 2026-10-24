@@ -27,11 +27,21 @@ class PoCService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        try {
+            createNotificationChannel()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Channel create failed", t)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(1, buildNotification())
+        try {
+            startForeground(1, buildNotification())
+        } catch (t: Throwable) {
+            updateStatus("startForeground FAILED: ${t.javaClass.simpleName}: ${t.message}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         Thread { runPoC() }.start()
         return START_STICKY
     }
@@ -51,7 +61,7 @@ class PoCService : Service() {
             )
 
             if (output.isNullOrBlank()) {
-                updateStatus("dumpsys returned nothing. Is Shizuku running?")
+                updateStatus("dumpsys returned nothing. Shizuku exec failed.")
                 return
             }
             Log.d(TAG, "dumpsys length: ${output.length}")
@@ -60,7 +70,16 @@ class PoCService : Service() {
             updateStatus("Found ${sessionIds.size} active session(s): $sessionIds")
 
             if (sessionIds.isEmpty()) {
-                updateStatus("No active sessions. Play some music, then tap again.")
+                // Dump a useful snippet of the raw output so we can diagnose the format
+                val keywords = listOf("Session", "Track", "Active", "Output thread", "Input thread", "Player", "uid")
+                val relevant = output.lines()
+                    .filter { line -> keywords.any { line.contains(it, ignoreCase = true) } }
+                    .take(40)
+                    .joinToString("\n")
+                val snippet = if (relevant.isNotBlank()) relevant else output.take(2000)
+                updateStatus(
+                    "No active sessions found.\n\n---RELEVANT LINES FROM DUMPSYS---\n$snippet"
+                )
                 return
             }
 
@@ -71,49 +90,100 @@ class PoCService : Service() {
             updateStatus(
                 "Applied −10 dB to $applied/${sessionIds.size} session(s). Listen for the drop!"
             )
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in PoC", e)
-            updateStatus("Error: ${e.message}")
+        } catch (t: Throwable) {
+            Log.e(TAG, "PoC fatal", t)
+            updateStatus("PoC exception: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
     /**
-     * Best-effort parser: finds every session whose nearby lines contain "ACTIVE".
+     * Column-aware parser for the tabular dumpsys media.audio_flinger output.
+     *
+     * Looks for a section starting with "N Tracks of which M are active", reads
+     * the header row to find the positions of "Session", "Active" and "S" columns,
+     * then extracts the Session ID from every data row whose Active column is "yes"
+     * or whose S column is "A".
      */
     private fun findAllActiveSessionIds(dumpsysOutput: String): List<Int> {
-        val result = mutableListOf<Int>()
+        val sessionIds = mutableListOf<Int>()
         val lines = dumpsysOutput.lines()
-        val sessionRegex = Regex("""Session\s*(?:ID)?\s*[:=]?\s*(\d+)""")
 
-        lines.forEachIndexed { index, line ->
-            val match = sessionRegex.find(line) ?: return@forEachIndexed
-            val id = match.groupValues[1].toIntOrNull() ?: return@forEachIndexed
-            if (id <= 0) return@forEachIndexed
+        var inTrackSection = false
+        var sessionCol = -1
+        var activeCol = -1
+        var sCol = -1
 
-            val start = maxOf(0, index - 2)
-            val end = minOf(lines.size, index + 8)
-            val block = lines.subList(start, end).joinToString("\n")
-            if (block.contains("ACTIVE", ignoreCase = true)) {
-                result.add(id)
+        for (rawLine in lines) {
+            val line = rawLine.trim()
+
+            // 1. Section start: "3 Tracks of which 1 are active"
+            if (line.contains("Tracks of which", ignoreCase = true) &&
+                line.contains("are active", ignoreCase = true)
+            ) {
+                val match = Regex("""(\d+)\s+Tracks of which\s+(\d+)\s+are active""")
+                    .find(line)
+                val activeCount = match?.groupValues?.get(2)?.toIntOrNull()
+                inTrackSection = (activeCount != null && activeCount > 0)
+                sessionCol = -1
+                activeCol = -1
+                sCol = -1
+                continue
+            }
+
+            if (!inTrackSection) continue
+
+            // 2. Header row (contains both "Session" and "Active")
+            if (sessionCol == -1 &&
+                line.contains("Session", ignoreCase = true) &&
+                line.contains("Active", ignoreCase = true)
+            ) {
+                val headers = line.split(Regex("""\s+"""))
+                sessionCol = headers.indexOfFirst { it.equals("Session", ignoreCase = true) }
+                activeCol = headers.indexOfFirst { it.equals("Active", ignoreCase = true) }
+                sCol = headers.indexOfFirst { it.equals("S", ignoreCase = true) }
+                continue
+            }
+
+            // 3. Section end: blank line or a new thread block
+            if (line.isBlank() ||
+                line.startsWith("Output thread", ignoreCase = true) ||
+                line.startsWith("Input thread", ignoreCase = true)
+            ) {
+                inTrackSection = false
+                continue
+            }
+
+            // 4. Data row
+            if (sessionCol >= 0) {
+                val cols = line.split(Regex("""\s+"""))
+                if (cols.size > maxOf(sessionCol, activeCol, sCol)) {
+                    val isActive =
+                        (activeCol >= 0 && cols[activeCol].equals("yes", ignoreCase = true)) ||
+                        (sCol >= 0 && cols[sCol].equals("A", ignoreCase = true))
+                    if (isActive) {
+                        cols[sessionCol].toIntOrNull()?.let { id ->
+                            if (id > 0) sessionIds.add(id)
+                        }
+                    }
+                }
             }
         }
-        return result.distinct()
+
+        return sessionIds.distinct()
     }
 
     private fun applyGainToSession(sessionId: Int, gainDb: Float): Boolean {
         return try {
-            // Stereo config — safest default for media playback
             val config = DynamicsProcessing.Config.Builder(
                 DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                2,      // stereo
-                true,   // pre-EQ in use
-                1,      // pre-EQ band count
-                false,  // no MBC
-                0,      // MBC band count
-                false,  // no post-EQ
-                0,      // post-EQ band count
-                false   // no limiter
+                2,
+                true,
+                1,
+                false,
+                0,
+                false,
+                0,
+                false
             ).build()
 
             val effect = DynamicsProcessing(0, sessionId, config)
@@ -121,13 +191,11 @@ class PoCService : Service() {
             effects.add(effect)
             Log.d(TAG, "Attached −10 dB to session $sessionId")
             true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed session $sessionId: ${e.message}", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Effect attach failed for session $sessionId: ${t.message}", t)
             false
         }
     }
-
-    // ── Shizuku plumbing ───────────────────────────────────────
 
     private fun runShizukuCommandWithOutput(command: Array<String>): String? {
         return try {
@@ -141,8 +209,8 @@ class PoCService : Service() {
             reader.close()
             process.waitFor()
             out.toString()
-        } catch (e: Exception) {
-            Log.e(TAG, "Shizuku exec failed", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Shizuku exec failed", t)
             null
         }
     }
@@ -159,14 +227,12 @@ class PoCService : Service() {
         return method.invoke(null, command, null, null) as ShizukuRemoteProcess
     }
 
-    // ── Notification ───────────────────────────────────────────
-
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
                 CHANNEL_ID, "Volume PoC Service", NotificationManager.IMPORTANCE_LOW
             )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
         }
     }
 
@@ -174,7 +240,9 @@ class PoCService : Service() {
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Volume PoC")
             .setContentText("Applying global gain…")
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
             .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
