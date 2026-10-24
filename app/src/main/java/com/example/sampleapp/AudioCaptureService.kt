@@ -24,6 +24,7 @@ import rikka.shizuku.ShizukuRemoteProcess
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import kotlin.concurrent.thread
+import kotlin.math.abs
 
 class AudioCaptureService : Service() {
 
@@ -39,6 +40,7 @@ class AudioCaptureService : Service() {
         @Volatile var gain: Float = 1.0f
 
         var statusCallback: ((String) -> Unit)? = null
+        var gainUpdateCallback: ((Float) -> Unit)? = null
         var currentStatus: String = "Idle"
     }
 
@@ -49,7 +51,7 @@ class AudioCaptureService : Service() {
 
     @Volatile private var isCapturing = false
     private var savedStreamVolume: Int = -1
-    private var mutedSource = false
+    private var sourceModified = false
 
     override fun onCreate() {
         super.onCreate()
@@ -59,7 +61,7 @@ class AudioCaptureService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> { stopCaptureAndRestore(); stopSelf(); return START_NOT_STICKY }
-            ACTION_START -> { /* fall through */ }
+            ACTION_START -> { }
             else -> { updateStatus("Service started without action"); return START_NOT_STICKY }
         }
 
@@ -86,19 +88,16 @@ class AudioCaptureService : Service() {
     private fun startCapture(resultCode: Int, resultData: Intent) {
         val report = StringBuilder()
 
-        // ── Read original STREAM_MUSIC volume via shell, then duck to 1 ──
+        // ── Save original volume, then mute source to 0 ──
         val getOut = shell("cmd media_session volume --stream 3 --get")
-        report.appendLine("--get output:\n${getOut.trim()}\n")
+        report.appendLine("--get: ${getOut.lines().lastOrNull { it.isNotBlank() } ?: ""}")
         savedStreamVolume = parseVolumeIndex(getOut)
-        report.appendLine("Saved original volume index: $savedStreamVolume")
+        report.appendLine("Saved original index: $savedStreamVolume")
 
-        // Duck to 1 (not 0): Musicolet won't trigger its "pause on 0" logic,
-        // and capture still gets non-silent audio.
-        val setOut = shell("cmd media_session volume --stream 3 --set 1")
-        report.appendLine("--set 1 output: ${setOut.trim()}")
-        mutedSource = true
+        val setOut = shell("cmd media_session volume --stream 3 --set 0")
+        report.appendLine("--set 0: ${setOut.lines().lastOrNull { it.isNotBlank() } ?: ""}")
+        sourceModified = true
 
-        // ── Capture setup (exclude our own UID) ──
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
         if (mediaProjection == null) {
@@ -140,7 +139,6 @@ class AudioCaptureService : Service() {
         }
         audioRecord = record
 
-        // ── Output: USAGE_ALARM (unaffected by STREAM_MUSIC mute) ──
         val outAttr = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_ALARM)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -167,24 +165,69 @@ class AudioCaptureService : Service() {
         track.play()
 
         report.appendLine()
-        report.appendLine("✓ Capturing. Original ducked to 1, our output via ALARM stream.")
-        report.appendLine("Move the slider to change gain in real time.")
-        report.appendLine("If nothing is heard: raise ALARM stream volume (Settings → Sound).")
+        report.appendLine("✓ Capturing with source at volume 0.")
+        report.appendLine("If capture is silent, will auto-fallback to volume 1.")
+        report.appendLine("Raise the ALARM stream volume if you hear nothing at all.")
         updateStatus(report.toString())
-        updateNotification("Capturing with gain=${(gain * 100).toInt()}%")
+        updateNotification("Gain: ${"%.1f".format(gain)}×")
 
-        captureThread = thread(name = "capture-loop") {
-            val buffer = ShortArray(minBuf / 2)
-            while (isCapturing) {
-                val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
-                if (read > 0) {
-                    val g = gain
-                    for (i in 0 until read) {
-                        buffer[i] = (buffer[i] * g).toInt().coerceIn(-32768, 32767).toShort()
-                    }
-                    audioTrack?.write(buffer, 0, read)
-                } else if (read < 0) break
+        captureThread = thread(name = "capture-loop") { captureLoop() }
+    }
+
+    private fun captureLoop() {
+        val buffer = ShortArray((audioRecord?.bufferSizeInFrames ?: 4096) * 2)
+        var everSawSignal = false
+        var consecutiveZeros = 0
+        var fallbackTriggered = false
+        val fallbackThreshold = 90     // ~2 seconds at typical buffer size
+
+        while (isCapturing) {
+            val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
+            if (read <= 0) {
+                if (read < 0) break
+                continue
             }
+
+            // ── Detect exactly-silent buffers ──
+            var maxAbs = 0
+            for (i in 0 until read) {
+                val v = abs(buffer[i].toInt())
+                if (v > maxAbs) maxAbs = v
+                if (maxAbs > 200) break
+            }
+
+            if (maxAbs > 200) {
+                everSawSignal = true
+                consecutiveZeros = 0
+            } else if (maxAbs == 0) {
+                consecutiveZeros++
+                if (!fallbackTriggered && !everSawSignal && consecutiveZeros >= fallbackThreshold) {
+                    // Volume 0 gave us silence from the start → fallback to volume 1
+                    shell("cmd media_session volume --stream 3 --set 1")
+                    gain = 15f
+                    gainUpdateCallback?.invoke(gain)
+                    fallbackTriggered = true
+                    updateStatus(
+                        "Volume 0 returned silent capture.\n" +
+                        "→ Auto-fallback: source volume → 1, gain → 15×.\n" +
+                        "You may hear a faint original underneath (the 1/15 whisper).\n" +
+                        "Adjust the slider to taste."
+                    )
+                    updateNotification("Fallback: source 1, gain 15×")
+                }
+            } else {
+                consecutiveZeros = 0
+            }
+
+            // ── Apply gain ──
+            val g = gain
+            if (g != 1.0f) {
+                for (i in 0 until read) {
+                    val v = (buffer[i] * g).toInt()
+                    buffer[i] = v.coerceIn(-32768, 32767).toShort()
+                }
+            }
+            audioTrack?.write(buffer, 0, read)
         }
     }
 
@@ -201,21 +244,24 @@ class AudioCaptureService : Service() {
         try { mediaProjection?.stop() } catch (_: Throwable) {}
         mediaProjection = null
         restoreSourceVolume()
-        updateStatus("Stopped. Original volume restored.")
+        updateStatus("Stopped. Original volume restored to index $savedStreamVolume.")
     }
 
     private fun restoreSourceVolume() {
-        if (!mutedSource) return
-        val target = if (savedStreamVolume in 1..99) savedStreamVolume else 10
+        if (!sourceModified) return
+        val target = if (savedStreamVolume in 0..99) savedStreamVolume else 10
         shell("cmd media_session volume --stream 3 --set $target")
         Log.d(TAG, "restored STREAM_MUSIC to $target")
-        mutedSource = false
+        sourceModified = false
     }
 
     private fun parseVolumeIndex(out: String): Int {
-        // Typical output: "volume: 10, stream: 3" or just "10"
-        Regex("""volume[:=]\s*(\d+)""").find(out)?.let { return it.groupValues[1].toInt() }
-        Regex("""^\s*(\d+)\s*$""", RegexOption.MULTILINE).find(out)?.let { return it.groupValues[1].toInt() }
+        Regex("""volume\s*(?:is|[:=])\s*(\d+)""", RegexOption.IGNORE_CASE)
+            .find(out)?.let { return it.groupValues[1].toInt() }
+        Regex("""index\s*[=:]?\s*(\d+)""", RegexOption.IGNORE_CASE)
+            .find(out)?.let { return it.groupValues[1].toInt() }
+        Regex("""^\s*(\d+)\s*$""", RegexOption.MULTILINE)
+            .find(out)?.let { return it.groupValues[1].toInt() }
         return -1
     }
 
