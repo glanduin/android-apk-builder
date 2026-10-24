@@ -37,16 +37,15 @@ class MainActivity : AppCompatActivity() {
 
         AudioCaptureService.statusCallback = { msg -> runOnUiThread { statusText.text = msg } }
 
-        // Listen for gain changes coming FROM the service (fallback auto-boost)
         AudioCaptureService.gainUpdateCallback = { g ->
             runOnUiThread {
-                val progress = ((g / MAX_GAIN) * 100).toInt().coerceIn(0, 100)
-                if (gainSeek.progress != progress) gainSeek.progress = progress
+                val p = ((g / MAX_GAIN) * 100).toInt().coerceIn(0, 100)
+                if (gainSeek.progress != p) gainSeek.progress = p
             }
         }
 
         gainSeek.max = 100
-        gainSeek.progress = 5                     // 1.0× — safe default if volume 0 gives full signal
+        gainSeek.progress = 5
         AudioCaptureService.gain = 1f
         gainLabel.text = "Gain: 5%  (1.0×)"
 
