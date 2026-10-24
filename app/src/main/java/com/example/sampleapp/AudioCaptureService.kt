@@ -25,6 +25,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import kotlin.concurrent.thread
 import kotlin.math.abs
+import kotlin.math.tanh
 
 class AudioCaptureService : Service() {
 
@@ -90,9 +91,13 @@ class AudioCaptureService : Service() {
         val report = StringBuilder()
 
         val getOut = shell("cmd media_session volume --stream 3 --get")
-        report.appendLine("--get: ${getOut.lines().lastOrNull { it.isNotBlank() } ?: ""}")
+        report.appendLine("MUSIC vol: ${getOut.lines().lastOrNull { it.isNotBlank() } ?: ""}")
         savedStreamVolume = parseVolumeIndex(getOut)
         report.appendLine("Saved original index: $savedStreamVolume")
+
+        val alarmOut = shell("cmd media_session volume --stream 4 --get")
+        report.appendLine("ALARM vol: ${alarmOut.lines().lastOrNull { it.isNotBlank() } ?: ""}")
+        report.appendLine("(our output goes through ALARM stream — if this is low, we're quiet)")
 
         shell("cmd media_session volume --stream 3 --set 0")
         shell("cmd media_session volume --stream 3 --mute")
@@ -146,10 +151,10 @@ class AudioCaptureService : Service() {
 
         report.appendLine()
         report.appendLine("✓ Capturing with ${if (usingFloat) "FLOAT" else "16-bit"} @ ${sampleRate}Hz.")
-        report.appendLine("Peak-normalization active (source over-drive corrected).")
-        report.appendLine("Watch notification for live peak reading.")
+        report.appendLine("Slider 50% = unity. Below = quieter. Above = boost (soft clip).")
+        report.appendLine("Notification shows: src peak × gain = output amplitude.")
         updateStatus(report.toString())
-        updateNotification("Starting…")
+        updateNotification("Ready")
 
         captureThread = thread(name = "capture-loop") {
             if (usingFloat) captureLoopFloat() else captureLoopShort()
@@ -251,19 +256,13 @@ class AudioCaptureService : Service() {
     private fun captureLoopFloat() {
         val record = audioRecord ?: return
         val track = audioTrack ?: return
-        // Stereo interleaved: need 2× frames as sample count
         val buffer = FloatArray(maxOf(record.bufferSizeInFrames * 2, 8192))
 
         var everSawSignal = false
         var zeroCount = 0
         var fallbackTriggered = false
         val fallbackThreshold = 60
-
-        // Peak-hold limiter state — rises fast, falls slow (no pumping)
-        var heldPeak = 1.0f
-        val decayPerBuffer = 0.9995f
         var bufferCount = 0
-        var maxPeakEver = 0f
 
         while (isCapturing) {
             val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
@@ -274,40 +273,34 @@ class AudioCaptureService : Service() {
                 val a = abs(buffer[i])
                 if (a > bufferPeak) bufferPeak = a
             }
-            if (bufferPeak > maxPeakEver) maxPeakEver = bufferPeak
 
-            // Fallback detection (volume 0 killed capture)
             if (bufferPeak > 0.005f) { everSawSignal = true; zeroCount = 0 }
             else if (bufferPeak == 0f) {
                 zeroCount++
                 if (!fallbackTriggered && !everSawSignal && zeroCount >= fallbackThreshold) {
                     shell("cmd media_session volume --stream 3 --unmute")
                     shell("cmd media_session volume --stream 3 --set 1")
-                    gain = 15f
+                    gain = 1.0f
                     gainUpdateCallback?.invoke(gain)
                     fallbackTriggered = true
-                    updateStatus("Volume 0 + mute killed capture. Fallback: unmuted, volume→1, gain→15×.")
+                    updateStatus("Volume 0 + mute killed capture. Fallback: volume→1 (faint original underneath).")
                 }
             } else zeroCount = 0
 
-            // Peak-hold limiter: normalize source over-drive, then apply user gain
-            heldPeak = maxOf(bufferPeak, heldPeak * decayPerBuffer)
-            val normalize = if (heldPeak > 1.0f) 1.0f / heldPeak else 1.0f
-            val totalGain = normalize * gain
-
+            val g = gain
             for (i in 0 until read) {
-                buffer[i] = (buffer[i] * totalGain).coerceIn(-1f, 1f)
+                buffer[i] = softClip(buffer[i] * g)
             }
             track.write(buffer, 0, read, AudioTrack.WRITE_BLOCKING)
 
             bufferCount++
             if (bufferCount % 50 == 0) {
-                updateNotification(
-                    "Peak ${"%.2f".format(heldPeak)} | g×${"%.1f".format(gain)} → ${"%.2f".format(totalGain)}"
-                )
+                val raw = bufferPeak * g
+                val out = minOf(raw, 1.0f)
+                val tag = if (raw > 1.05f) " CLIP" else ""
+                updateNotification("src ${"%.2f".format(bufferPeak)} × ${"%.2f".format(g)} = ${"%.2f".format(out)}$tag")
             }
         }
-        Log.d(TAG, "session end. max source peak: $maxPeakEver")
     }
 
     private fun captureLoopShort() {
@@ -319,11 +312,7 @@ class AudioCaptureService : Service() {
         var zeroCount = 0
         var fallbackTriggered = false
         val fallbackThreshold = 60
-
-        var heldPeak = 1.0f
-        val decayPerBuffer = 0.9995f
         var bufferCount = 0
-        var maxPeakEver = 0f
 
         while (isCapturing) {
             val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
@@ -334,7 +323,6 @@ class AudioCaptureService : Service() {
                 val a = abs(buffer[i].toInt()) / 32768f
                 if (a > bufferPeak) bufferPeak = a
             }
-            if (bufferPeak > maxPeakEver) maxPeakEver = bufferPeak
 
             if (bufferPeak > 0.005f) { everSawSignal = true; zeroCount = 0 }
             else if (bufferPeak == 0f) {
@@ -342,32 +330,43 @@ class AudioCaptureService : Service() {
                 if (!fallbackTriggered && !everSawSignal && zeroCount >= fallbackThreshold) {
                     shell("cmd media_session volume --stream 3 --unmute")
                     shell("cmd media_session volume --stream 3 --set 1")
-                    gain = 15f
+                    gain = 1.0f
                     gainUpdateCallback?.invoke(gain)
                     fallbackTriggered = true
-                    updateStatus("Volume 0 + mute killed capture (16-bit). Fallback: unmuted, volume→1, gain→15×.")
+                    updateStatus("Volume 0 + mute killed capture (16-bit). Fallback: volume→1.")
                 }
             } else zeroCount = 0
 
-            heldPeak = maxOf(bufferPeak, heldPeak * decayPerBuffer)
-            val normalize = if (heldPeak > 1.0f) 1.0f / heldPeak else 1.0f
-            val totalGain = normalize * gain
-
+            val g = gain
             for (i in 0 until read) {
                 val x = buffer[i].toFloat() / 32768f
-                val y = (x * totalGain).coerceIn(-1f, 1f)
-                buffer[i] = (y * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+                buffer[i] = (softClip(x * g) * 32767f).toInt().coerceIn(-32768, 32767).toShort()
             }
             track.write(buffer, 0, read, AudioTrack.WRITE_BLOCKING)
 
             bufferCount++
             if (bufferCount % 50 == 0) {
-                updateNotification(
-                    "Peak ${"%.2f".format(heldPeak)} | g×${"%.1f".format(gain)} → ${"%.2f".format(totalGain)}"
-                )
+                val raw = bufferPeak * g
+                val out = minOf(raw, 1.0f)
+                val tag = if (raw > 1.05f) " CLIP" else ""
+                updateNotification("src ${"%.2f".format(bufferPeak)} × ${"%.2f".format(g)} = ${"%.2f".format(out)}$tag")
             }
         }
-        Log.d(TAG, "session end. max source peak: $maxPeakEver")
+    }
+
+    /**
+     * Soft limiter: linear below 0.9, smooth compression above.
+     * For |x| ≤ 0.9: output = x (bit-exact pass-through).
+     * For |x| > 0.9: compressed into (0.9, 1.0] via tanh.
+     * Result: no harsh clipping, gradual loudness on boost.
+     */
+    private fun softClip(x: Float): Float {
+        val threshold = 0.9f
+        if (abs(x) <= threshold) return x
+        val sign = if (x >= 0f) 1f else -1f
+        val excess = abs(x) - threshold
+        val compressed = threshold + (1f - threshold) * tanh(excess / (1f - threshold))
+        return sign * compressed
     }
 
     private fun stopCaptureAndRestore() {
