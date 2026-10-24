@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
@@ -42,6 +43,10 @@ class AudioCaptureService : Service() {
 
     @Volatile private var isCapturing = false
 
+    private var originalStreamVolume: Int = -1
+    private var originalStreamMuted: Boolean = false
+    private var didMuteStream: Boolean = false
+
     override fun onCreate() {
         super.onCreate()
         try { createNotificationChannel() } catch (t: Throwable) { Log.e(TAG, "channel", t) }
@@ -54,7 +59,7 @@ class AudioCaptureService : Service() {
         }
 
         try {
-            startForeground(1, buildNotification())
+            startForeground(1, buildNotification("Capturing and replaying audio…"))
         } catch (t: Throwable) {
             updateStatus("startForeground FAILED: ${t.javaClass.simpleName}: ${t.message}")
             stopSelf()
@@ -80,6 +85,8 @@ class AudioCaptureService : Service() {
     }
 
     private fun startCapture(resultCode: Int, resultData: Intent) {
+        val report = StringBuilder()
+
         val projectionManager =
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
@@ -89,8 +96,37 @@ class AudioCaptureService : Service() {
             return
         }
 
-        // ─── KEY FIX #1: exclude our own UID from capture ───
-        // Otherwise our AudioTrack output gets captured and replayed forever.
+        // ── Step 1: Mute the source stream so the original stops playing ──
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        originalStreamVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        originalStreamMuted = am.isStreamMute(AudioManager.STREAM_MUSIC)
+
+        try {
+            am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+        } catch (t: Throwable) {
+            report.appendLine("adjustStreamVolume(ADJUST_MUTE) threw: ${t.message}")
+        }
+
+        val nowMuted = am.isStreamMute(AudioManager.STREAM_MUSIC)
+        didMuteStream = nowMuted && !originalStreamMuted
+        if (nowMuted) {
+            report.appendLine("✓ STREAM_MUSIC muted (original silenced)")
+        } else {
+            report.appendLine("✗ STREAM_MUSIC mute FAILED — you will hear double audio.")
+            report.appendLine("  (Funtouch blocks volume APIs. We proceed anyway.)")
+        }
+
+        // Check STREAM_ALARM volume — this is where OUR output will play
+        val alarmVol = am.getStreamVolume(AudioManager.STREAM_ALARM)
+        val alarmMax = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+        report.appendLine("Alarm stream volume: $alarmVol / $alarmMax")
+        if (alarmVol == 0) {
+            report.appendLine("⚠ Alarm volume is 0 — our replay will be silent.")
+            report.appendLine("  Raise the 'Alarm' slider to hear our output.")
+        }
+        report.appendLine()
+
+        // ── Step 2: Set up capture (exclude our own UID to prevent feedback) ──
         val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
@@ -105,7 +141,7 @@ class AudioCaptureService : Service() {
 
         val minBufBytes = AudioRecord.getMinBufferSize(sampleRate, inChannelMask, encoding)
         if (minBufBytes <= 0) {
-            updateStatus("getMinBufferSize returned $minBufBytes — audio not available.")
+            updateStatus("$report\ngetMinBufferSize returned $minBufBytes — audio not available.")
             return
         }
 
@@ -122,17 +158,16 @@ class AudioCaptureService : Service() {
             .build()
 
         if (record.state != AudioRecord.STATE_INITIALIZED) {
-            updateStatus("AudioRecord not initialized (state=${record.state}).")
+            updateStatus("$report\nAudioRecord not initialized (state=${record.state}).")
             record.release()
             return
         }
         audioRecord = record
 
-        // ─── KEY FIX #2: mark our output as non-capturable ───
-        // Belt-and-suspenders: even without the UID exclusion above, our
-        // replay track will never be captured because we tag it as such.
+        // ── Step 3: Route our replay via STREAM_ALARM so the mute doesn't hit it ──
+        // USAGE_ALARM maps to STREAM_ALARM, which is unaffected by STREAM_MUSIC mute.
         val outAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setUsage(AudioAttributes.USAGE_ALARM)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_NONE)
             .build()
@@ -151,9 +186,10 @@ class AudioCaptureService : Service() {
             .build()
 
         if (track.state != AudioTrack.STATE_INITIALIZED) {
-            updateStatus("AudioTrack not initialized (state=${track.state}).")
+            updateStatus("$report\nAudioTrack not initialized (state=${track.state}).")
             track.release()
             record.release()
+            restoreStreamState(am)
             return
         }
         audioTrack = track
@@ -161,7 +197,10 @@ class AudioCaptureService : Service() {
         isCapturing = true
         record.startRecording()
         track.play()
-        updateStatus("Capturing. You should hear delayed audio within ~1 second.\n(No loop: our own output is excluded.)")
+        report.appendLine("Capturing. You should hear ONLY our replay.")
+        report.appendLine("If you hear echo, mute FAILED — see above.")
+        updateStatus(report.toString())
+        updateNotification("Capturing — replay via alarm stream")
 
         captureThread = thread(name = "capture-loop") {
             val buffer = ShortArray(minBufBytes / 2)
@@ -169,9 +208,7 @@ class AudioCaptureService : Service() {
             while (isCapturing) {
                 val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
                 if (read > 0) {
-                    // Phase 1: pass through unchanged.
-                    // Phase 2 will apply gain here:
-                    //   for (i in 0 until read) buffer[i] = (buffer[i] * gain).toInt().toShort()
+                    // Phase 1: pass-through. Phase 2 will apply gain here.
                     audioTrack?.write(buffer, 0, read)
                     totalRead += read
                 } else if (read < 0) {
@@ -180,9 +217,20 @@ class AudioCaptureService : Service() {
                 }
             }
             Log.d(TAG, "capture loop ended, total samples read: $totalRead")
-            if (isCapturing) {
-                updateStatus("Capture loop ended unexpectedly (total samples=$totalRead).")
+        }
+    }
+
+    private fun restoreStreamState(am: AudioManager) {
+        try {
+            if (didMuteStream && !originalStreamMuted) {
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
             }
+            if (originalStreamVolume >= 0) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, originalStreamVolume, 0)
+            }
+            Log.d(TAG, "restored STREAM_MUSIC to vol=$originalStreamVolume muted=$originalStreamMuted")
+        } catch (t: Throwable) {
+            Log.e(TAG, "restoreStreamState failed", t)
         }
     }
 
@@ -190,6 +238,13 @@ class AudioCaptureService : Service() {
         Log.d(TAG, msg)
         currentStatus = msg
         statusCallback?.invoke(msg)
+    }
+
+    private fun updateNotification(text: String) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(1, buildNotification(text))
+        } catch (_: Throwable) {}
     }
 
     private fun createNotificationChannel() {
@@ -201,10 +256,10 @@ class AudioCaptureService : Service() {
         }
     }
 
-    private fun buildNotification(): Notification =
+    private fun buildNotification(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Audio Capture PoC")
-            .setContentText("Capturing and replaying audio…")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -225,5 +280,8 @@ class AudioCaptureService : Service() {
         audioTrack = null
         try { mediaProjection?.stop() } catch (_: Throwable) {}
         mediaProjection = null
+
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        restoreStreamState(am)
     }
 }
