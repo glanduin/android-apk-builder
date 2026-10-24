@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -17,30 +18,34 @@ class MainActivity : AppCompatActivity() {
     private val SHIZUKU_PERMISSION_REQUEST_CODE = 1001
     private val NOTIFICATION_PERMISSION_REQUEST_CODE = 1002
 
+    private lateinit var statusText: TextView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-        val button = Button(this).apply {
-            text = "Start Volume PoC"
-            setOnClickListener {
-                if (checkShizukuPermission()) {
-                    startPoCService()
-                } else {
-                    requestShizukuPermission()
-                }
+        statusText = findViewById(R.id.statusText)
+        statusText.text = PoCService.currentStatus
+
+        // Wire the service's status updates to the TextView
+        PoCService.statusCallback = { msg ->
+            runOnUiThread { statusText.text = msg }
+        }
+
+        findViewById<Button>(R.id.startButton).setOnClickListener {
+            if (checkShizukuPermission()) {
+                startPoCService()
+            } else {
+                requestShizukuPermission()
             }
         }
-        setContentView(button)
 
         requestNotificationPermissionIfNeeded()
     }
 
     private fun checkShizukuPermission(): Boolean {
-        return if (Shizuku.isPreV11()) {
-            false
-        } else {
-            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        }
+        return !Shizuku.isPreV11() &&
+                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
     }
 
     private fun requestShizukuPermission() {
@@ -68,9 +73,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startPoCService() {
-        val serviceIntent = Intent(this, PoCService::class.java)
-        ContextCompat.startForegroundService(this, serviceIntent)
-        Toast.makeText(this, "Service started. Check logcat for session discovery.", Toast.LENGTH_LONG).show()
+        val intent = Intent(this, PoCService::class.java)
+        ContextCompat.startForegroundService(this, intent)
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -85,5 +89,10 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        PoCService.statusCallback = null
     }
 }
