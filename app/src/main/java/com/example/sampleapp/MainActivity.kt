@@ -44,8 +44,8 @@ class MainActivity : AppCompatActivity() {
 
         volumeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                volumeLabel.text = "Volume: $progress%"
-                if (fromUser) applyMediaControllerVolume(progress / 100f)
+                volumeLabel.text = "Slider: $progress%"
+                if (fromUser) applyVolume(progress)
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -87,26 +87,35 @@ class MainActivity : AppCompatActivity() {
             mediaController = MediaController(this, musicolet.sessionToken)
             val pb = mediaController?.playbackInfo
             statusText.text = "✓ Attached to in.krosbits.musicolet\n" +
-                "volume=${pb?.currentVolume} / max=${pb?.maxVolume}\n" +
-                "Drag the slider to test."
+                "currentVolume=${pb?.currentVolume}  maxVolume=${pb?.maxVolume}\n\n" +
+                "Drag the slider. If maxVolume is a big number (e.g. 100+), " +
+                "Musicolet handles its own volume and we get fine-grained steps for free."
         } catch (t: Throwable) {
             statusText.text = "attach failed: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
-    private fun applyMediaControllerVolume(volume: Float) {
+    private fun applyVolume(progressPercent: Int) {
         val ctrl = mediaController
         if (ctrl == null) {
             statusText.text = "No controller. Tap 'Attach to Musicolet' first."
             return
         }
         try {
-            // ✅ The fix: volume goes through TransportControls, not MediaController directly.
-            ctrl.transportControls.setVolume(volume)
-            val newVol = ctrl.playbackInfo?.currentVolume
-            statusText.text = "setVolume($volume) → reported volume: $newVol"
+            val info = ctrl.playbackInfo
+            val maxVol = info?.maxVolume?.takeIf { it > 0 } ?: 100
+            val targetVol = (progressPercent.toFloat() / 100f * maxVol)
+                .toInt()
+                .coerceIn(0, maxVol)
+
+            // The correct MediaController volume API: index-based, not float.
+            ctrl.setVolumeTo(targetVol, 0)
+
+            val after = ctrl.playbackInfo
+            statusText.text =
+                "setVolumeTo($targetVol) → reported: ${after?.currentVolume} / $maxVol"
         } catch (t: Throwable) {
-            statusText.text = "setVolume failed: ${t.javaClass.simpleName}: ${t.message}"
+            statusText.text = "setVolumeTo failed: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
