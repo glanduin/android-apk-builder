@@ -8,68 +8,45 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Shell Mute Tests"
-        android:textSize="16sp"
+        android:text="Fine-Grained Volume"
+        android:textSize="18sp"
         android:textStyle="bold" />
-
-    <Button
-        android:id="@+id/cmdMediaSession"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="A: cmd media_session volume --stream 3 --set 0" />
-
-    <Button
-        android:id="@+id/cmdAudio"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="B: cmd audio set-volume --stream 3 --index 0" />
-
-    <Button
-        android:id="@+id/cmdSettings"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="C: settings put system volume_music 0" />
-
-    <Button
-        android:id="@+id/cmdServiceCall"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="D: service call audio (raw binder)" />
-
-    <Button
-        android:id="@+id/attachButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
-        android:visibility="gone"
-        android:text="attach" />
-
-    <SeekBar
-        android:id="@+id/volumeSeek"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:visibility="gone"
-        android:max="100"
-        android:progress="100" />
-
-    <TextView
-        android:id="@+id/volumeLabel"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:visibility="gone"
-        android:text="" />
 
     <Button
         android:id="@+id/startButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="Start (mute source + replay with gain)" />
+
+    <Button
+        android:id="@+id/stopButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Stop (restore original volume)" />
+
+    <TextView
+        android:id="@+id/gainLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="Gain: 100%"
+        android:textSize="16sp" />
+
+    <SeekBar
+        android:id="@+id/gainSeek"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="100"
+        android:progress="100" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:visibility="gone"
-        android:text="(old) capture" />
+        android:text="Drag left to reduce volume. 0% = silent, 100% = original loudness."
+        android:textSize="12sp" />
 
     <ScrollView
         android:layout_width="match_parent"
@@ -81,7 +58,7 @@
             android:id="@+id/statusText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Idle"
+            android:text="Idle.\n\nStart music in Musicolet, then tap Start."
             android:textSize="12sp"
             android:textIsSelectable="true"
             android:fontFamily="monospace" />
